@@ -1603,9 +1603,10 @@ fn handle_pre_tool_use(
         });
         output.merge(&browser_test_output);
 
-        // PR merge gate — block gh pr merge without confirmation (Bash only)
+        // PR merge gate — fetch the PR's real review/CI state and decide
+        // (allow silently / deny with the blocking facts / ask when unknown).
         let pr_output = time_and_record(ctx.fs, &mk_ctx("pr_merge_gate"), || {
-            authorize_pr_merge_with_graph(input, ctx.env)
+            authorize_pr_merge_with_graph(input, ctx.env, ctx.process)
         });
         output.merge(&pr_output);
 
@@ -5200,8 +5201,9 @@ fn write_production_action_notice_graph_audit(
 fn authorize_pr_merge_with_graph(
     input: &sentinel_domain::events::HookInput,
     env: &dyn hooks::EnvPort,
+    process: &dyn hooks::ProcessPort,
 ) -> HookOutput {
-    let evaluation = hooks::pr_merge_gate::evaluate(input, env);
+    let evaluation = hooks::pr_merge_gate::evaluate(input, env, process);
     if !evaluation.graph_authority_required() {
         return hooks::pr_merge_gate::output_from_evaluation(&evaluation);
     }
@@ -5268,6 +5270,9 @@ fn pr_merge_expected_decision(
         hooks::pr_merge_gate::PrMergeDecision::AllowAutopilotReminder => {
             sentinel_infrastructure::pr_merge_graph::PrMergeDecision::AllowAutopilotReminder
         }
+        hooks::pr_merge_gate::PrMergeDecision::Deny => {
+            sentinel_infrastructure::pr_merge_graph::PrMergeDecision::Deny
+        }
     }
 }
 
@@ -5314,9 +5319,14 @@ fn pr_merge_graph_identifier(
             anyhow!("PR merge LangGraph authority requires concrete command evidence")
         })?;
     let command_hash = sentinel_infrastructure::pr_merge_graph::command_sha256(command);
+    // The fetched verdict is part of the thread identity: the same command can
+    // legitimately resolve to allow/deny/ask on different fetches (a PR gets
+    // approved, CI goes green), and each must be a distinct audited decision.
     Ok(format!(
-        "{session_id}:{tool}:{operation}:{command_hash}:ask-{}:context-{}",
-        evaluation.permission_prompt_required, evaluation.context_reminder_required
+        "{session_id}:{tool}:{operation}:{command_hash}:verdict-{}:ask-{}:context-{}",
+        evaluation.verdict.label(),
+        evaluation.permission_prompt_required,
+        evaluation.context_reminder_required
     ))
 }
 
@@ -7007,6 +7017,31 @@ description = "Claim"
 
     struct NoopEnv;
 
+    /// `gh` that always fails, so pr_merge_gate's fetch lands in the
+    /// unknown-state branch deterministically (no host `gh`/network involved).
+    struct UnfetchableGh;
+
+    impl sentinel_domain::ports::ProcessPort for UnfetchableGh {
+        fn run(
+            &self,
+            _: &str,
+            _: &[&str],
+            _: Option<&str>,
+        ) -> Result<sentinel_domain::ports::ProcessOutput, sentinel_domain::port_errors::ProcessError>
+        {
+            Err(sentinel_domain::port_errors::ProcessError::Io(
+                "gh not available".to_string(),
+            ))
+        }
+        fn spawn_detached(
+            &self,
+            _: &str,
+            _: &[&str],
+        ) -> Result<(), sentinel_domain::port_errors::ProcessError> {
+            Ok(())
+        }
+    }
+
     impl sentinel_domain::ports::EnvPort for NoopEnv {
         fn var(&self, _key: &str) -> Option<String> {
             None
@@ -8562,7 +8597,7 @@ description = "Claim"
             ..Default::default()
         };
 
-        let output = authorize_pr_merge_with_graph(&input, &env);
+        let output = authorize_pr_merge_with_graph(&input, &env, &UnfetchableGh);
 
         assert!(output.blocked.is_none());
         let hso = output.hook_specific_output.expect("hook-specific output");

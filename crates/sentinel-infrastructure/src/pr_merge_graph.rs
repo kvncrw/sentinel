@@ -29,6 +29,8 @@ pub enum PrMergeDecision {
     Allow,
     Ask,
     AllowAutopilotReminder,
+    /// Verified PR state contradicts the merge — hard block.
+    Deny,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,6 +42,11 @@ pub struct PrMergeState {
     pub command_sha256: Option<String>,
     pub operation: String,
     pub pr_lifecycle_operation: bool,
+    /// The fetched-state verdict the hook derived: `not_applicable`, `clear`,
+    /// `blocked`, or `unknown`. This is the fact the decision hangs on now —
+    /// the graph replica must model it or it will deny every real decision on
+    /// an authority mismatch.
+    pub merge_verdict: String,
     pub autopilot: bool,
     pub permission_prompt_required: bool,
     pub context_reminder_required: bool,
@@ -61,7 +68,8 @@ impl PrMergeState {
             command_present: evaluation.command_present,
             command_sha256,
             operation: operation_label(evaluation.operation).to_string(),
-            pr_lifecycle_operation: !matches!(evaluation.operation, PrMergeOperation::None),
+            pr_lifecycle_operation: evaluation.gated,
+            merge_verdict: evaluation.verdict.label().to_string(),
             autopilot: evaluation.autopilot,
             permission_prompt_required: evaluation.permission_prompt_required,
             context_reminder_required: evaluation.context_reminder_required,
@@ -126,6 +134,7 @@ const CLASSIFY: &str = "classify";
 const ALLOW: &str = "allow";
 const ASK: &str = "ask";
 const ALLOW_AUTOPILOT_REMINDER: &str = "allow_autopilot_reminder";
+const DENY: &str = "deny";
 
 pub type PrMergeGraph = CompilationResult<PrMergeState>;
 
@@ -145,6 +154,7 @@ pub fn pr_merge_decision_label(decision: PrMergeDecision) -> &'static str {
         PrMergeDecision::Allow => "allow",
         PrMergeDecision::Ask => "ask",
         PrMergeDecision::AllowAutopilotReminder => "allow-autopilot-reminder",
+        PrMergeDecision::Deny => "deny",
     }
 }
 
@@ -162,7 +172,9 @@ fn optional_hex_digest_present(value: &Option<String>) -> bool {
 }
 
 fn expected_decision(state: &PrMergeState) -> PrMergeDecision {
-    if state.permission_prompt_required {
+    if state.merge_verdict == "blocked" {
+        PrMergeDecision::Deny
+    } else if state.permission_prompt_required {
         PrMergeDecision::Ask
     } else if state.context_reminder_required {
         PrMergeDecision::AllowAutopilotReminder
@@ -202,6 +214,7 @@ fn pr_merge_state_schema() -> StateSchema<PrMergeState> {
                 "command_sha256",
                 "operation",
                 "pr_lifecycle_operation",
+                "merge_verdict",
                 "autopilot",
                 "permission_prompt_required",
                 "context_reminder_required",
@@ -225,6 +238,10 @@ fn pr_merge_state_schema() -> StateSchema<PrMergeState> {
                 },
                 "operation": { "type": "string", "enum": ["none", "merge", "close"] },
                 "pr_lifecycle_operation": { "type": "boolean" },
+                "merge_verdict": {
+                    "type": "string",
+                    "enum": ["not_applicable", "clear", "blocked", "unknown"]
+                },
                 "autopilot": { "type": "boolean" },
                 "permission_prompt_required": { "type": "boolean" },
                 "context_reminder_required": { "type": "boolean" },
@@ -234,7 +251,8 @@ fn pr_merge_state_schema() -> StateSchema<PrMergeState> {
                         "Unclassified",
                         "Allow",
                         "Ask",
-                        "AllowAutopilotReminder"
+                        "AllowAutopilotReminder",
+                        "Deny"
                     ]
                 }
             },
@@ -263,6 +281,7 @@ fn pr_merge_state_schema() -> StateSchema<PrMergeState> {
                 if state.command_sha256.is_some()
                     || state.operation != "none"
                     || state.pr_lifecycle_operation
+                    || state.merge_verdict != "not_applicable"
                     || state.permission_prompt_required
                     || state.context_reminder_required
                 {
@@ -276,12 +295,31 @@ fn pr_merge_state_schema() -> StateSchema<PrMergeState> {
                     "pr_merge command_sha256 must be a 64-character hex digest".to_string(),
                 ));
             }
-            let expected_pr_lifecycle = matches!(state.operation.as_str(), "merge" | "close");
-            if state.pr_lifecycle_operation != expected_pr_lifecycle {
+            // `gh pr merge` always gates. `gh pr close` only gates when the
+            // default-off SENTINEL_PR_CLOSE_GATE opt-in is set, so a close can
+            // legitimately arrive un-gated; what can never happen is a gated
+            // decision on a command that is neither.
+            if state.pr_lifecycle_operation
+                && !matches!(state.operation.as_str(), "merge" | "close")
+            {
                 return Err(StateError::ValidationFailed(format!(
-                    "pr_merge pr_lifecycle_operation must match operation: expected \
-                     {expected_pr_lifecycle}, got {}",
-                    state.pr_lifecycle_operation
+                    "pr_merge pr_lifecycle_operation requires a merge/close operation, got {}",
+                    state.operation
+                )));
+            }
+            if state.operation == "merge" && !state.pr_lifecycle_operation {
+                return Err(StateError::ValidationFailed(
+                    "pr_merge merge operations are always gated".to_string(),
+                ));
+            }
+            // A verdict only exists where the gate actually fetched state.
+            let verdict_expected_applicable = state.pr_lifecycle_operation;
+            let verdict_applicable = state.merge_verdict != "not_applicable";
+            if verdict_applicable != verdict_expected_applicable {
+                return Err(StateError::ValidationFailed(format!(
+                    "pr_merge merge_verdict must be not_applicable exactly when the gate does \
+                     not apply: gated={}, merge_verdict={}",
+                    state.pr_lifecycle_operation, state.merge_verdict
                 )));
             }
             if !state.bash_tool
@@ -299,21 +337,24 @@ fn pr_merge_state_schema() -> StateSchema<PrMergeState> {
                         .to_string(),
                 ));
             }
-            let expected_prompt =
-                state.bash_tool && state.pr_lifecycle_operation && !state.autopilot;
+            let unknown_state = state.merge_verdict == "unknown";
+            let expected_prompt = state.bash_tool
+                && state.pr_lifecycle_operation
+                && unknown_state
+                && !state.autopilot;
             if state.permission_prompt_required != expected_prompt {
                 return Err(StateError::ValidationFailed(format!(
                     "pr_merge permission_prompt_required must match Bash/operation/autopilot \
-                     policy: expected {expected_prompt}, got {}",
+                     verdict policy: expected {expected_prompt}, got {}",
                     state.permission_prompt_required
                 )));
             }
             let expected_context =
-                state.bash_tool && state.pr_lifecycle_operation && state.autopilot;
+                state.bash_tool && state.pr_lifecycle_operation && unknown_state && state.autopilot;
             if state.context_reminder_required != expected_context {
                 return Err(StateError::ValidationFailed(format!(
                     "pr_merge context_reminder_required must match Bash/operation/autopilot \
-                     policy: expected {expected_context}, got {}",
+                     verdict policy: expected {expected_context}, got {}",
                     state.context_reminder_required
                 )));
             }
@@ -432,16 +473,34 @@ async fn build_pr_merge_graph_with_checkpointer(
             ),
             crate::decision_graph_introspection::decision_node_error_handler,
         )
+        .add_async_node_with_config_and_error_handler(
+            DENY,
+            |s: PrMergeState| async move {
+                emit_decision_node_event("pr_merge", DENY, &s.identifier)?;
+                let mut next = s;
+                next.decision = PrMergeDecision::Deny;
+                Ok::<_, NodeError>(next)
+            },
+            node_config(
+                DENY,
+                checkpointer_backend,
+                checkpointer_scope,
+                checkpointer_tenant_scope,
+            ),
+            crate::decision_graph_introspection::decision_node_error_handler,
+        )
         .add_edge(START, CLASSIFY)
         .add_conditional_edge(CLASSIFY, |s: &PrMergeState| match expected_decision(s) {
             PrMergeDecision::Allow => ALLOW.into(),
             PrMergeDecision::Ask => ASK.into(),
             PrMergeDecision::AllowAutopilotReminder => ALLOW_AUTOPILOT_REMINDER.into(),
+            PrMergeDecision::Deny => DENY.into(),
             PrMergeDecision::Unclassified => ALLOW.into(),
         })
         .add_edge(ALLOW, END)
         .add_edge(ASK, END)
-        .add_edge(ALLOW_AUTOPILOT_REMINDER, END);
+        .add_edge(ALLOW_AUTOPILOT_REMINDER, END)
+        .add_edge(DENY, END);
     let graph = builder.build().map_err(|e| e.to_string())?;
     GraphCompiler::new()
         .with_checkpointer(checkpointer.into_saver())
@@ -490,11 +549,29 @@ pub fn pr_merge_graph_topology(compiled: &PrMergeGraph) -> Result<DecisionGraphT
 mod tests {
     use super::*;
     use sentinel_application::hooks::pr_merge_gate::{
-        PrMergeDecision as AppDecision, PrMergeEvaluation,
+        MergeVerdict, PrMergeDecision as AppDecision, PrMergeEvaluation,
     };
 
-    fn evaluation(operation: PrMergeOperation, autopilot: bool) -> PrMergeEvaluation {
-        let pr_lifecycle_operation = !matches!(operation, PrMergeOperation::None);
+    /// Build an evaluation exactly the way the hook does, so the replica is
+    /// tested against the real decision policy rather than a restatement of it.
+    fn evaluation(
+        operation: PrMergeOperation,
+        autopilot: bool,
+        verdict: MergeVerdict,
+    ) -> PrMergeEvaluation {
+        let gated = !matches!(operation, PrMergeOperation::None);
+        let unknown = gated && matches!(verdict, MergeVerdict::Unknown);
+        let permission_prompt_required = unknown && !autopilot;
+        let context_reminder_required = unknown && autopilot;
+        let decision = if matches!(verdict, MergeVerdict::Blocked) {
+            AppDecision::Deny
+        } else if permission_prompt_required {
+            AppDecision::Ask
+        } else if context_reminder_required {
+            AppDecision::AllowAutopilotReminder
+        } else {
+            AppDecision::Allow
+        };
         PrMergeEvaluation {
             tool: Some("Bash".to_string()),
             command: Some(match operation {
@@ -505,16 +582,19 @@ mod tests {
             bash_tool: true,
             command_present: true,
             operation,
-            autopilot,
-            permission_prompt_required: pr_lifecycle_operation && !autopilot,
-            context_reminder_required: pr_lifecycle_operation && autopilot,
-            decision: if pr_lifecycle_operation && !autopilot {
-                AppDecision::Ask
-            } else if pr_lifecycle_operation && autopilot {
-                AppDecision::AllowAutopilotReminder
+            gated,
+            pr_number: Some("1".to_string()),
+            verdict: if gated {
+                verdict
             } else {
-                AppDecision::Allow
+                MergeVerdict::NotApplicable
             },
+            state_summary: None,
+            blocking_reasons: Vec::new(),
+            autopilot,
+            permission_prompt_required,
+            context_reminder_required,
+            decision,
         }
     }
 
@@ -525,6 +605,11 @@ mod tests {
             bash_tool: true,
             command_present: false,
             operation: PrMergeOperation::None,
+            gated: false,
+            pr_number: None,
+            verdict: MergeVerdict::NotApplicable,
+            state_summary: None,
+            blocking_reasons: Vec::new(),
             autopilot: false,
             permission_prompt_required: false,
             context_reminder_required: false,
@@ -537,7 +622,7 @@ mod tests {
         let graph = build_pr_merge_graph_with_ephemeral_sqlite().await.unwrap();
         let state = PrMergeState::from_evaluation(
             "pr-merge-ask",
-            &evaluation(PrMergeOperation::Merge, false),
+            &evaluation(PrMergeOperation::Merge, false, MergeVerdict::Unknown),
         );
         assert_eq!(state.tool.as_deref(), Some("Bash"));
         assert!(optional_hex_digest_present(&state.command_sha256));
@@ -565,8 +650,8 @@ mod tests {
     async fn graph_authorizes_autopilot_context_reminder() {
         let graph = build_pr_merge_graph_with_ephemeral_sqlite().await.unwrap();
         let state = PrMergeState::from_evaluation(
-            "pr-close-autopilot",
-            &evaluation(PrMergeOperation::Close, true),
+            "pr-merge-autopilot",
+            &evaluation(PrMergeOperation::Merge, true, MergeVerdict::Unknown),
         );
         let run = run_pr_merge_decision_report(&graph, state).await.unwrap();
         assert_eq!(run.state.decision, PrMergeDecision::AllowAutopilotReminder);
@@ -577,7 +662,7 @@ mod tests {
         let graph = build_pr_merge_graph_with_ephemeral_sqlite().await.unwrap();
         let mut state = PrMergeState::from_evaluation(
             "pr-merge-forged",
-            &evaluation(PrMergeOperation::Merge, false),
+            &evaluation(PrMergeOperation::Merge, false, MergeVerdict::Unknown),
         );
         state.permission_prompt_required = false;
         let err = run_pr_merge_decision_report(&graph, state)
@@ -589,7 +674,7 @@ mod tests {
     #[tokio::test]
     async fn graph_schema_rejects_missing_tool_identity() {
         let graph = build_pr_merge_graph_with_ephemeral_sqlite().await.unwrap();
-        let mut evaluation = evaluation(PrMergeOperation::Merge, false);
+        let mut evaluation = evaluation(PrMergeOperation::Merge, false, MergeVerdict::Unknown);
         evaluation.tool = None;
         let state = PrMergeState::from_evaluation("pr-merge-missing-tool", &evaluation);
         let err = run_pr_merge_decision_report(&graph, state)
@@ -603,7 +688,7 @@ mod tests {
         let graph = build_pr_merge_graph_with_ephemeral_sqlite().await.unwrap();
         let mut state = PrMergeState::from_evaluation(
             "pr-merge-missing-digest",
-            &evaluation(PrMergeOperation::Merge, false),
+            &evaluation(PrMergeOperation::Merge, false, MergeVerdict::Unknown),
         );
         state.command_sha256 = None;
         let err = run_pr_merge_decision_report(&graph, state)
@@ -624,5 +709,43 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("missing-command"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn graph_authorizes_clear_merge_as_silent_allow() {
+        let graph = build_pr_merge_graph_with_ephemeral_sqlite().await.unwrap();
+        let state = PrMergeState::from_evaluation(
+            "pr-merge-clear",
+            &evaluation(PrMergeOperation::Merge, true, MergeVerdict::Clear),
+        );
+        assert_eq!(state.merge_verdict, "clear");
+        let run = run_pr_merge_decision_report(&graph, state).await.unwrap();
+        assert_eq!(run.state.decision, PrMergeDecision::Allow);
+    }
+
+    #[tokio::test]
+    async fn graph_authorizes_blocked_merge_as_deny_even_in_autopilot() {
+        let graph = build_pr_merge_graph_with_ephemeral_sqlite().await.unwrap();
+        let state = PrMergeState::from_evaluation(
+            "pr-merge-blocked",
+            &evaluation(PrMergeOperation::Merge, true, MergeVerdict::Blocked),
+        );
+        let run = run_pr_merge_decision_report(&graph, state).await.unwrap();
+        assert_eq!(run.state.decision, PrMergeDecision::Deny);
+        assert_eq!(pr_merge_decision_label(run.state.decision), "deny");
+    }
+
+    #[tokio::test]
+    async fn graph_schema_rejects_verdict_on_an_ungated_command() {
+        let graph = build_pr_merge_graph_with_ephemeral_sqlite().await.unwrap();
+        let mut state = PrMergeState::from_evaluation(
+            "pr-merge-ungated-verdict",
+            &evaluation(PrMergeOperation::None, false, MergeVerdict::NotApplicable),
+        );
+        state.merge_verdict = "blocked".to_string();
+        let err = run_pr_merge_decision_report(&graph, state)
+            .await
+            .unwrap_err();
+        assert!(err.contains("merge_verdict"), "{err}");
     }
 }

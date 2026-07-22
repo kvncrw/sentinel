@@ -538,16 +538,129 @@ fn commit_message_validator_denies_nonconventional_allows_conventional() {
     );
 }
 
+/// Install a stub `gh` into the temp home and prepend it to PATH, so the
+/// fetch-and-decide gate resolves a deterministic PR state end-to-end instead
+/// of whatever the host's real `gh` says.
+fn seed_stub_gh(t: &mut HookTest, json_payload: &str) {
+    let bin = t.home_path().join("stubbin");
+    std::fs::create_dir_all(&bin).expect("mk stubbin");
+    let gh = bin.join("gh");
+    std::fs::write(
+        &gh,
+        format!("#!/bin/sh\ncat <<'STUBEOF'\n{json_payload}\nSTUBEOF\n"),
+    )
+    .expect("write stub gh");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = std::env::var("PATH").unwrap_or_default();
+    t.env("PATH", &format!("{}:{path}", bin.display()));
+}
+
 #[test]
-fn pr_merge_gate_asks_confirmation_when_not_autopilot() {
-    // `gh pr merge` is a soft gate: outside autopilot it must downgrade to an
-    // `ask` (confirm-before-merge), NOT a hard deny. SENTINEL_AUTOPILOT is
-    // forced off so the autopilot bypass (ask → context-only allow) doesn't fire.
-    // (`gh pr merge` is not a task_decomposition_gate marker, so that gate does
-    // not pre-empt this verdict.)
+fn pr_merge_gate_denies_merge_with_changes_requested_and_failing_ci() {
+    // The fetch-and-decide contract: verified-bad state is a DETERMINISTIC
+    // deny, not a coin-flip ask — and autopilot does not downgrade it.
+    let mut t = HookTest::new();
+    t.env("SENTINEL_AUTOPILOT", "1");
+    seed_stub_gh(
+        &mut t,
+        r#"{"baseRefName":"main","mergeable":"MERGEABLE","reviewDecision":"CHANGES_REQUESTED",
+            "reviews":[{"author":{"login":"mkoslowski"},"state":"CHANGES_REQUESTED"}],
+            "statusCheckRollup":[{"name":"integration","status":"COMPLETED","conclusion":"FAILURE"}]}"#,
+    );
+    let gh = "gh"; // assembled so source has no verbatim "gh pr merge"
+    let merge = format!("{gh} pr merge 7 --squash");
+    let res = t.run(
+        "PreToolUse",
+        json!({"tool_name":"Bash","tool_input":{"command": merge},
+               "cwd": t.home_path().to_string_lossy()}),
+    );
+    assert_eq!(
+        res.json.pointer("/hookSpecificOutput/permissionDecision"),
+        Some(&json!("deny")),
+        "verified CHANGES_REQUESTED + failing CI must deny: {}",
+        res.json
+    );
+    let reason = res
+        .json
+        .pointer("/hookSpecificOutput/permissionDecisionReason")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        reason.contains("Remedy:"),
+        "deny must be instructive: {reason}"
+    );
+}
+
+#[test]
+fn pr_merge_gate_allows_approved_and_green_merge_silently() {
+    // Routine merge on verified-good state costs the operator nothing.
+    let mut t = HookTest::new();
+    t.env("SENTINEL_AUTOPILOT", "1");
+    seed_stub_gh(
+        &mut t,
+        r#"{"baseRefName":"main","mergeable":"MERGEABLE","reviewDecision":"APPROVED",
+            "reviews":[{"author":{"login":"mkoslowski"},"state":"APPROVED"}],
+            "statusCheckRollup":[{"name":"build","status":"COMPLETED","conclusion":"SUCCESS"}]}"#,
+    );
+    let gh = "gh";
+    let merge = format!("{gh} pr merge 5 --squash");
+    let res = t.run(
+        "PreToolUse",
+        json!({"tool_name":"Bash","tool_input":{"command": merge},
+               "cwd": t.home_path().to_string_lossy()}),
+    );
+    assert_ne!(
+        res.json.pointer("/hookSpecificOutput/permissionDecision"),
+        Some(&json!("deny")),
+        "approved+green must not be denied: {}",
+        res.json
+    );
+    assert_ne!(
+        res.json.pointer("/hookSpecificOutput/permissionDecision"),
+        Some(&json!("ask")),
+        "approved+green must not ask: {}",
+        res.json
+    );
+    let reason = res
+        .json
+        .pointer("/hookSpecificOutput/permissionDecisionReason")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        !reason.contains("PR Merge Gate"),
+        "approved+green must produce no PR-gate message at all: {reason}"
+    );
+}
+
+#[test]
+fn pr_merge_gate_asks_when_pr_state_cannot_be_fetched() {
+    // The critical fail-mode: unknown state must ask — never silently allow
+    // (a reckless merge slips through) and never hard-block (fail-closed gates
+    // bricked the bench once already).
     let mut t = HookTest::new();
     t.env("SENTINEL_AUTOPILOT", "0");
-    let gh = "gh"; // assembled so source has no verbatim "gh pr merge"
+    // A `gh` stub that always fails, so state genuinely cannot be established.
+    let bin = t.home_path().join("stubbin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let ghbin = bin.join("gh");
+    std::fs::write(
+        &ghbin,
+        "#!/bin/sh\necho 'gh: not authenticated' >&2\nexit 1\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&ghbin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = std::env::var("PATH").unwrap_or_default();
+    t.env("PATH", &format!("{}:{path}", bin.display()));
+
+    let gh = "gh";
     let merge = format!("{gh} pr merge 123 --squash");
     let res = t.run(
         "PreToolUse",
@@ -555,6 +668,31 @@ fn pr_merge_gate_asks_confirmation_when_not_autopilot() {
                "cwd": t.home_path().to_string_lossy()}),
     );
     res.assert_ask();
+}
+
+#[test]
+fn pr_merge_gate_no_longer_fires_on_pr_close() {
+    // Closing a PR is reversible (reopenable); clean reviewers judged the
+    // escalation unwarranted 0/3. The gate must be silent by default.
+    let mut t = HookTest::new();
+    t.env("SENTINEL_AUTOPILOT", "0");
+    let gh = "gh";
+    let close = format!("{gh} pr close 12");
+    let res = t.run(
+        "PreToolUse",
+        json!({"tool_name":"Bash","tool_input":{"command": close},
+               "cwd": t.home_path().to_string_lossy()}),
+    );
+    let reason = res
+        .json
+        .pointer("/hookSpecificOutput/permissionDecisionReason")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        !reason.contains("PR Merge Gate"),
+        "pr close must not trip the merge gate: {}",
+        res.json
+    );
 }
 
 #[test]
