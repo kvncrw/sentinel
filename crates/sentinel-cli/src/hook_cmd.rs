@@ -7785,7 +7785,17 @@ description = "Claim"
         let _lock = env_lock();
         let home = tempfile::tempdir().expect("temp home");
         let _home = EnvGuard::set("SENTINEL_HOME", home.path());
+        // Pin claude_dir() to the tempdir so the config override below is
+        // read deterministically, regardless of any ambient CLAUDE_CONFIG_DIR.
+        let _claude_dir = EnvGuard::set("SENTINEL_CLAUDE_DIR", home.path().join(".claude"));
         let _backend = EnvGuard::set("SENTINEL_DECISION_GRAPH_CHECKPOINTER", "sqlite");
+        let cfg_dir = home.path().join(".claude").join("sentinel").join("config");
+        std::fs::create_dir_all(&cfg_dir).expect("seed sentinel config dir");
+        std::fs::write(
+            cfg_dir.join("task-decomposition-gate.toml"),
+            "enabled = true\n",
+        )
+        .expect("enable task_decomposition_gate for this test");
         let git = sentinel_infrastructure::git::RealGit;
         let fs = sentinel_infrastructure::filesystem::RealFileSystem;
         let process = sentinel_infrastructure::process::RealProcess;
@@ -8183,7 +8193,14 @@ description = "Claim"
         let _lock = env_lock();
         let home = tempfile::tempdir().expect("temp home");
         let _home = EnvGuard::set("SENTINEL_HOME", home.path());
+        // Pin claude_dir() to the tempdir so the config override below is
+        // read deterministically, regardless of any ambient CLAUDE_CONFIG_DIR.
+        let _claude_dir = EnvGuard::set("SENTINEL_CLAUDE_DIR", home.path().join(".claude"));
         let _backend = EnvGuard::set("SENTINEL_DECISION_GRAPH_CHECKPOINTER", "sqlite");
+        let cfg_dir = home.path().join(".claude").join("sentinel").join("config");
+        std::fs::create_dir_all(&cfg_dir).expect("seed sentinel config dir");
+        std::fs::write(cfg_dir.join("tool-usage-gate.toml"), "enabled = true\n")
+            .expect("enable tool_usage_gate for this test");
         let fs = sentinel_infrastructure::filesystem::RealFileSystem;
         let classifier =
             sentinel_application::reversibility_classifier::StaticReversibilityClassifier::empty()

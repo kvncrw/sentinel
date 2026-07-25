@@ -10,9 +10,10 @@
 # unparseable file falls back to `true` (fail closed to enforcement).
 sequential_thinking_check = true
 
-# enabled — master switch for the whole gate. Set to false to disable every
-# check (the gate allows all tool calls and consults no graph authority).
-# Intended for controlled environments — e.g. benchmark arms that measure
-# Claude Code without this gate — NOT for day-to-day operation. A missing key
-# or an unparseable file falls back to `true` (fail closed to enforcement).
-enabled = true
+# enabled — master switch for the whole gate. `false` (the shipped default)
+# allows all tool calls and consults no graph authority. Defaulted off because
+# the gate benchmarked net-negative for capable agents — it over-blocks into
+# thrash and lowers task completion (sentinel-bench 2026-07-23 process-gate
+# A/B). Set to `true` to re-enable. A corrupt/unparseable operator override
+# still falls back to the enforced default (fail closed) — unchanged.
+enabled = false

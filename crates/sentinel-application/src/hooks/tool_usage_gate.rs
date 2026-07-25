@@ -775,6 +775,7 @@ mod tests {
         // it must DENY — not silently allow. Pins the fail-closed behavior so a
         // refactor can't flip this read error into an allow.
         let tmp = TempDir::new().unwrap();
+        seed_gate_config(tmp.path(), "enabled = true\n");
         let fs = RealFs::new(tmp.path().to_path_buf());
         // A transcript_path that points at a file which does not exist →
         // RealFs::read_to_string returns Err → DenyTranscriptAuthority.
@@ -811,6 +812,7 @@ mod tests {
         // task directory cannot be read/parsed, the gate cannot confirm an
         // in_progress task exists, so it must DENY rather than allow the edit.
         let tmp = TempDir::new().unwrap();
+        seed_gate_config(tmp.path(), "enabled = true\n");
         let home = tmp.path();
         let fs = RealFs::new(home.to_path_buf());
         // A well-formed transcript that satisfies the sequential-thinking check
@@ -911,6 +913,7 @@ mod tests {
     #[test]
     fn missing_session_id_denies() {
         let tmp = TempDir::new().unwrap();
+        seed_gate_config(tmp.path(), "enabled = true\n");
         let fs = RealFs::new(tmp.path().to_path_buf());
         let input = HookInput {
             tool_name: Some("Edit".to_string()),
@@ -931,6 +934,7 @@ mod tests {
     #[test]
     fn missing_transcript_path_denies() {
         let tmp = TempDir::new().unwrap();
+        seed_gate_config(tmp.path(), "enabled = true\n");
         let fs = RealFs::new(tmp.path().to_path_buf());
         let input = HookInput {
             tool_name: Some("Edit".to_string()),
@@ -952,6 +956,7 @@ mod tests {
     #[test]
     fn blocks_without_sequential_thinking_even_with_plan_and_task() {
         let tmp = TempDir::new().unwrap();
+        seed_gate_config(tmp.path(), "enabled = true\n");
         let home = tmp.path();
         let fs = RealFs::new(home.to_path_buf());
         seed_claude_json_with_sequential(home);
@@ -1168,6 +1173,7 @@ mod tests {
     #[test]
     fn blocks_without_session_task() {
         let tmp = TempDir::new().unwrap();
+        seed_gate_config(tmp.path(), "enabled = true\n");
         let fs = RealFs::new(tmp.path().to_path_buf());
         let transcript = write_transcript(&[
             assistant_tool_use("mcp__sequential-thinking__sequentialthinking"),
@@ -1189,6 +1195,7 @@ mod tests {
     #[test]
     fn blocks_when_plan_is_not_approved() {
         let tmp = TempDir::new().unwrap();
+        seed_gate_config(tmp.path(), "enabled = true\n");
         let home = tmp.path();
         let fs = RealFs::new(home.to_path_buf());
         let transcript = write_transcript(&[
@@ -1212,6 +1219,7 @@ mod tests {
     #[test]
     fn blocks_without_in_progress_task_and_uses_pending_hint() {
         let tmp = TempDir::new().unwrap();
+        seed_gate_config(tmp.path(), "enabled = true\n");
         let home = tmp.path();
         let fs = RealFs::new(home.to_path_buf());
         let transcript = write_transcript(&[
@@ -1258,6 +1266,7 @@ mod tests {
     #[test]
     fn old_temp_marker_files_do_not_authorize_gate() {
         let tmp = TempDir::new().unwrap();
+        seed_gate_config(tmp.path(), "enabled = true\n");
         let home = tmp.path();
         let fs = RealFs::new(home.to_path_buf());
         let session = "sess-marker";
@@ -1335,6 +1344,7 @@ mod tests {
     #[test]
     fn a3_enabled_still_gates_reversible_with_effort() {
         let tmp = TempDir::new().unwrap();
+        seed_gate_config(tmp.path(), "enabled = true\n");
         let fs = RealFs::new(tmp.path().to_path_buf());
         let input = HookInput {
             tool_name: Some("Edit".to_string()),

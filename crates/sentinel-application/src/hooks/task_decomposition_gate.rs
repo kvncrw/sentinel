@@ -513,6 +513,17 @@ pub fn output_from_evaluation(evaluation: &TaskDecompositionEvaluation) -> HookO
 
 #[cfg(test)]
 mod tests {
+
+    fn seed_gate_enabled(home: &std::path::Path) {
+        let dir = home.join(".claude").join("sentinel").join("config");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("task-decomposition-gate.toml"),
+            "enabled = true
+",
+        )
+        .unwrap();
+    }
     use super::*;
     use crate::hooks::test_support::{stub_ctx, StubFs};
     use std::path::{Path, PathBuf};
@@ -771,6 +782,7 @@ mod tests {
     #[test]
     fn edit_with_no_task_list_blocks() {
         let tmp = tempfile::tempdir().unwrap();
+        seed_gate_enabled(tmp.path());
         let fs: &'static ScopedHomeFs = Box::leak(Box::new(ScopedHomeFs {
             home: tmp.path().to_path_buf(),
         }));
@@ -849,6 +861,7 @@ mod tests {
     #[test]
     fn mutating_bash_with_no_tasks_blocks() {
         let tmp = tempfile::tempdir().unwrap();
+        seed_gate_enabled(tmp.path());
         let fs: &'static ScopedHomeFs = Box::leak(Box::new(ScopedHomeFs {
             home: tmp.path().to_path_buf(),
         }));
@@ -1031,6 +1044,7 @@ mod tests {
     #[test]
     fn block_message_contains_convention_markers() {
         let tmp = tempfile::tempdir().unwrap();
+        seed_gate_enabled(tmp.path());
         let fs: &'static ScopedHomeFs = Box::leak(Box::new(ScopedHomeFs {
             home: tmp.path().to_path_buf(),
         }));

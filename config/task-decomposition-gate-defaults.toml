@@ -3,10 +3,11 @@
 # Operator override: ~/.claude/sentinel/config/task-decomposition-gate.toml
 # (wholesale replacement, same schema — mirrors tool-usage-gate.toml).
 #
-# enabled — master switch for the whole gate. Set to false to disable it
-# entirely (mutating tools are never blocked for a missing task list and no
-# graph authority is consulted). Intended for controlled environments — e.g.
-# benchmark arms that measure Claude Code without this gate — NOT for
-# day-to-day operation. A missing key or an unparseable file falls back to
-# `true` (fail closed to enforcement).
-enabled = true
+# enabled — master switch for the whole gate. `false` (the shipped default)
+# never blocks mutating tools for a missing task list and consults no graph
+# authority. Defaulted off because the gate benchmarked net-negative for
+# capable agents — over-blocking into thrash lowers completion (sentinel-bench
+# 2026-07-23 process-gate A/B). Set to `true` to re-enable. A corrupt/
+# unparseable operator override still falls back to the enforced default
+# (fail closed) — unchanged.
+enabled = false
