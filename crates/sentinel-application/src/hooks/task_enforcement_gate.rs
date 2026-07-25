@@ -383,7 +383,11 @@ mod tests {
         let tmp = setup(&[("1.json", "pending")]);
         let cfg_dir = tmp.path().join(".claude").join("sentinel").join("config");
         std::fs::create_dir_all(&cfg_dir).unwrap();
-        std::fs::write(cfg_dir.join("task-enforcement-gate.toml"), "enabled = false\n").unwrap();
+        std::fs::write(
+            cfg_dir.join("task-enforcement-gate.toml"),
+            "enabled = false\n",
+        )
+        .unwrap();
         let fs = TestHomeFs::new(tmp.path());
         let git = RepoGit {
             root: tmp.path().to_string_lossy().to_string(),
