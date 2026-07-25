@@ -1,0 +1,20 @@
+# Task Enforcement Gate — shipped defaults.
+#
+# Operator override: ~/.claude/sentinel/config/task-enforcement-gate.toml
+# (wholesale replacement, same schema — mirrors task-decomposition-gate.toml
+# and tool-usage-gate.toml).
+#
+# enabled — master switch for the whole gate. `false` (the shipped default)
+# never blocks mutating tools for a missing in_progress task. Defaulted OFF
+# for the same posture as task_decomposition_gate + tool_usage_gate (sentinel
+# PR #32): it is a hard mutation-block in the same process-enforcement class,
+# and it shares tool_usage_gate's headless deadlock mode — the "ask the
+# operator to create a task" unblock path does not exist in autonomous/
+# headless runs, so an on-by-default work-blocking gate can wedge non-
+# interactive agents. Unlike #32 this default is precautionary, not measured:
+# enforcement's cheap instructive deny may yet prove net-positive, in which
+# case flip it back ON with evidence (the enforce-vs-decompose head-to-head is
+# the test). Set to `true` to re-enable. A corrupt/unparseable operator
+# override still falls back to enforcement (fail closed) — same contract as the
+# other gates.
+enabled = false

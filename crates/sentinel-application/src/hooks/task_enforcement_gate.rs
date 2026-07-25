@@ -23,9 +23,13 @@
 //! missing / unreadable task dir, or not in a repo → allow. A gate that fails
 //! closed on a read glitch would brick the session; this one never does.
 //!
-//! ## Kill switch
-//! `SENTINEL_TASK_GATE` set to `off` / `0` / `false` / `disable` (any case)
-//! disables the gate entirely without a rebuild. Unset (the default) enforces.
+//! ## Master switch
+//! `task-enforcement-gate.toml` `enabled` toggles the gate (operator override at
+//! `~/.claude/sentinel/config/`). Shipped default is `false` — off by default,
+//! same posture as the process gates (PR #32), since this is a hard mutation-
+//! block that can deadlock headless agents. Same config-file lever as the other
+//! gates — no hidden env setting. A corrupt/unparseable config falls back to
+//! enabled (fail closed to enforcement).
 
 use std::path::Path;
 
@@ -36,9 +40,61 @@ use super::{concrete_input_session_id, session_task_dir, FileSystemPort, HookCon
 /// Tools this gate blocks when no task is in progress — the code mutators.
 const GATED_TOOLS: &[&str] = &["Edit", "Write", "NotebookEdit"];
 
-/// Env var to disable the gate. Any of these values (case-insensitive) → off.
-const KILL_SWITCH_ENV: &str = "SENTINEL_TASK_GATE";
-const OFF_VALUES: &[&str] = &["off", "0", "false", "disable", "disabled", "no"];
+/// Shipped defaults, compiled in. Operator override lives at
+/// `~/.claude/sentinel/config/task-enforcement-gate.toml` (same schema).
+const SHIPPED_DEFAULTS: &str =
+    include_str!("../../../../config/task-enforcement-gate-defaults.toml");
+
+/// Gate config — the master switch, mirroring `task_decomposition_gate` and
+/// `tool_usage_gate`. Replaces the former `SENTINEL_TASK_GATE` env kill-switch
+/// so this gate is toggled through the same config-file lever as every other
+/// gate, with no hidden env setting.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TaskEnforcementGateConfig {
+    /// Master switch. `false` disables the whole gate: mutating tools are never
+    /// blocked for a missing in_progress task. Missing/corrupt config falls
+    /// back to `true` — fail closed to enforcement, same contract as the other
+    /// gates.
+    #[serde(default = "default_true")]
+    enabled: bool,
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+impl Default for TaskEnforcementGateConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+impl TaskEnforcementGateConfig {
+    fn from_toml_or_default(s: &str) -> Self {
+        toml::from_str(s).unwrap_or_else(|e| {
+            eprintln!(
+                "[sentinel] task_enforcement_gate: config TOML parse failed ({e}); \
+                 using enforced defaults"
+            );
+            Self::default()
+        })
+    }
+}
+
+/// Load config: shipped defaults, then the operator override file if present.
+fn load_config(fs: &dyn FileSystemPort) -> TaskEnforcementGateConfig {
+    let mut cfg = TaskEnforcementGateConfig::from_toml_or_default(SHIPPED_DEFAULTS);
+    let path = fs
+        .claude_dir()
+        .join("sentinel")
+        .join("config")
+        .join("task-enforcement-gate.toml");
+    if let Ok(content) = fs.read_to_string(&path) {
+        cfg = TaskEnforcementGateConfig::from_toml_or_default(&content);
+    }
+    cfg
+}
 
 /// A native task row — only the status matters here.
 #[derive(Debug, serde::Deserialize)]
@@ -55,14 +111,6 @@ pub enum GateDecision {
     Allow,
     /// Blocked — a gated code mutation with no in_progress task.
     Block { tool: String },
-}
-
-/// True when `SENTINEL_TASK_GATE` is set to an off value (case-insensitive).
-fn gate_disabled() -> bool {
-    std::env::var(KILL_SWITCH_ENV)
-        .ok()
-        .map(|v| v.trim().to_ascii_lowercase())
-        .is_some_and(|v| OFF_VALUES.contains(&v.as_str()))
 }
 
 /// Count the in_progress / total task files in `dir`. Returns `(in_progress,
@@ -102,8 +150,8 @@ fn scan_tasks(fs: &dyn FileSystemPort, dir: &Path) -> (usize, usize) {
 /// Decide whether to gate this tool call. Pure over the injected `fs`/`git`.
 #[must_use]
 pub fn evaluate(input: &HookInput, ctx: &HookContext<'_>) -> GateDecision {
-    // Kill switch — off means the gate is inert.
-    if gate_disabled() {
+    // Master switch (operator config `enabled = false`): gate stands down.
+    if !load_config(ctx.fs).enabled {
         return GateDecision::Allow;
     }
 
@@ -152,7 +200,7 @@ fn block_message(tool: &str) -> String {
          task should be, ASK the operator whether they'd like you to create and \
          start one for them, or prefer to do it themselves — enforce the hygiene, \
          but be helpful about it. (`TaskCreate`/`TaskUpdate` are never gated. To \
-         turn this gate off set SENTINEL_TASK_GATE=off.)"
+         disable this gate set `enabled = false` in task-enforcement-gate.toml.)"
     )
 }
 
@@ -173,10 +221,6 @@ mod tests {
     use super::*;
     use crate::hooks::test_support::{stub_ctx_with_fs, TestHomeFs};
     use sentinel_domain::port_errors::GitError;
-    use std::sync::Mutex;
-
-    /// Serialize env-var mutation across tests (the kill switch reads a global).
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// A git port that reports a specific repo root — the default `StubGit`
     /// returns `None`, which would make the gate always fail-open. Only
@@ -237,6 +281,15 @@ mod tests {
         .unwrap();
     }
 
+    /// Write an operator override enabling the gate. The shipped default is OFF
+    /// (off-by-default, PR #32 posture), so tests that exercise the ACTIVE gate
+    /// must opt it in — mirrors `task_decomposition_gate::seed_gate_enabled`.
+    fn seed_gate_enabled(home: &Path) {
+        let dir = home.join(".claude").join("sentinel").join("config");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("task-enforcement-gate.toml"), "enabled = true\n").unwrap();
+    }
+
     const SID: &str = "gate-sess-1";
 
     /// Create a tempdir home, seed a `session-<first8>` task dir with the given
@@ -252,6 +305,9 @@ mod tests {
         for (f, s) in status_files {
             write_task(&dir, f, s);
         }
+        // Gate ships OFF by default; the active-gate tests want it enabled.
+        // (operator_config_enabled_false_disables_gate overwrites this after.)
+        seed_gate_enabled(tmp.path());
         tmp
     }
 
@@ -278,8 +334,6 @@ mod tests {
 
     #[test]
     fn blocks_edit_when_no_in_progress_task() {
-        let _g = ENV_LOCK.lock().unwrap();
-        std::env::remove_var(KILL_SWITCH_ENV);
         let tmp = setup(&[("1.json", "pending"), ("2.json", "completed")]);
         let fs = TestHomeFs::new(tmp.path());
         let git = RepoGit {
@@ -311,8 +365,6 @@ mod tests {
 
     #[test]
     fn allows_edit_when_a_task_is_in_progress() {
-        let _g = ENV_LOCK.lock().unwrap();
-        std::env::remove_var(KILL_SWITCH_ENV);
         let tmp = setup(&[("1.json", "in_progress")]);
         let fs = TestHomeFs::new(tmp.path());
         let git = RepoGit {
@@ -324,24 +376,29 @@ mod tests {
     }
 
     #[test]
-    fn kill_switch_disables_gate() {
-        let _g = ENV_LOCK.lock().unwrap();
-        std::env::set_var(KILL_SWITCH_ENV, "OFF");
+    fn operator_config_enabled_false_disables_gate() {
+        // Same present-but-no-in_progress task dir that blocks above — but the
+        // operator override disables the gate via the config file, so the edit
+        // is allowed. Replaces the former SENTINEL_TASK_GATE env kill-switch.
         let tmp = setup(&[("1.json", "pending")]);
+        let cfg_dir = tmp.path().join(".claude").join("sentinel").join("config");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(cfg_dir.join("task-enforcement-gate.toml"), "enabled = false\n").unwrap();
         let fs = TestHomeFs::new(tmp.path());
         let git = RepoGit {
             root: tmp.path().to_string_lossy().to_string(),
         };
         let ctx = ctx_with(&fs, &git);
         let input = input_for("Edit", tmp.path(), Some(SID));
-        assert_eq!(evaluate(&input, &ctx), GateDecision::Allow, "off → allow");
-        std::env::remove_var(KILL_SWITCH_ENV);
+        assert_eq!(
+            evaluate(&input, &ctx),
+            GateDecision::Allow,
+            "enabled = false → allow"
+        );
     }
 
     #[test]
     fn non_mutating_tools_always_allowed() {
-        let _g = ENV_LOCK.lock().unwrap();
-        std::env::remove_var(KILL_SWITCH_ENV);
         let tmp = setup(&[("1.json", "pending")]);
         let fs = TestHomeFs::new(tmp.path());
         let git = RepoGit {
@@ -356,8 +413,6 @@ mod tests {
 
     #[test]
     fn edits_outside_a_repo_are_allowed() {
-        let _g = ENV_LOCK.lock().unwrap();
-        std::env::remove_var(KILL_SWITCH_ENV);
         let tmp = setup(&[("1.json", "pending")]);
         let fs = TestHomeFs::new(tmp.path());
         // Default StubGit → repo_root None → not in a repo → allow.
@@ -372,10 +427,9 @@ mod tests {
 
     #[test]
     fn missing_task_dir_fails_open() {
-        let _g = ENV_LOCK.lock().unwrap();
-        std::env::remove_var(KILL_SWITCH_ENV);
         // Home tmp but NO task dir created → is_dir false → allow.
         let tmp = tempfile::tempdir().unwrap();
+        seed_gate_enabled(tmp.path()); // active gate, so the allow is fail-open not off
         let fs = TestHomeFs::new(tmp.path());
         let git = RepoGit {
             root: tmp.path().to_string_lossy().to_string(),
@@ -391,8 +445,6 @@ mod tests {
 
     #[test]
     fn no_session_id_fails_open() {
-        let _g = ENV_LOCK.lock().unwrap();
-        std::env::remove_var(KILL_SWITCH_ENV);
         let tmp = setup(&[("1.json", "pending")]);
         let fs = TestHomeFs::new(tmp.path());
         let git = RepoGit {
@@ -408,15 +460,27 @@ mod tests {
     }
 
     #[test]
-    fn gate_disabled_recognises_off_values() {
-        let _g = ENV_LOCK.lock().unwrap();
-        for v in ["off", "0", "false", "disable", "DISABLED", "No"] {
-            std::env::set_var(KILL_SWITCH_ENV, v);
-            assert!(gate_disabled(), "{v} should disable");
-        }
-        std::env::set_var(KILL_SWITCH_ENV, "1");
-        assert!(!gate_disabled(), "1 should enforce");
-        std::env::remove_var(KILL_SWITCH_ENV);
-        assert!(!gate_disabled(), "unset should enforce");
+    fn shipped_default_disables_the_gate() {
+        // The compiled-in shipped default keeps the gate OFF — off-by-default,
+        // same posture as the process gates (PR #32). An operator opts in with
+        // enabled = true.
+        assert!(
+            !TaskEnforcementGateConfig::from_toml_or_default(SHIPPED_DEFAULTS).enabled,
+            "shipped default must be disabled (off by default)"
+        );
+    }
+
+    #[test]
+    fn corrupt_config_fails_closed_to_enabled() {
+        // A garbage override must fall back to enforcement, not silently disable.
+        assert!(
+            TaskEnforcementGateConfig::from_toml_or_default("not =[ valid toml").enabled,
+            "corrupt config must fail closed to enabled"
+        );
+        // An explicit disable still parses and disables.
+        assert!(
+            !TaskEnforcementGateConfig::from_toml_or_default("enabled = false").enabled,
+            "explicit enabled=false must disable"
+        );
     }
 }

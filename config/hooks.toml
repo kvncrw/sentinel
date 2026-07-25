@@ -108,7 +108,7 @@ has_api_call = false
 id = "task-enforcement-gate"
 event = "PreToolUse"
 matcher = ["Edit", "Write", "NotebookEdit"]
-description = "HELPFUL-BLOCK: deny Edit/Write/NotebookEdit when the session has no in_progress task (work must be tracked). Deny message guides the agent to create+start a task — or ask the operator whether to create one for them. Only gates edits inside a git repo; fails open on any read error / missing task dir / non-repo. Kill switch: SENTINEL_TASK_GATE=off."
+description = "HELPFUL-BLOCK: deny Edit/Write/NotebookEdit when the session has no in_progress task (work must be tracked). Deny message guides the agent to create+start a task — or ask the operator whether to create one for them. Only gates edits inside a git repo; fails open on any read error / missing task dir / non-repo. Master switch: task-enforcement-gate.toml enabled = false."
 depends_on = []
 has_api_call = false
 
