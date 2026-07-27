@@ -622,6 +622,84 @@ match = "(?i)DELETE[[:space:]]+FROM[[:space:]]+[a-zA-Z_]+[[:space:]]*;"
 class = "Catastrophic"
 # DELETE FROM <table>; without WHERE — full-table wipe.
 
+# --- 2026-07 db_ops evasion class: wrapper-fed + driver-level destructive SQL.
+# The patterns below close the forms the three rules above miss: tautology
+# WHEREs (1=1/true), delete-alls terminated by a quote or newline instead
+# of a semicolon (here-string / heredoc / -c payloads), TRUNCATE without
+# the TABLE keyword, inline-interpreter driver one-liners, and quoted /
+# schema-qualified identifiers (`TRUNCATE "orders"`,
+# `DELETE FROM "public"."orders"`, backtick-quoted MySQL forms) — the
+# shared identifier fragment appears verbatim in each pattern since TOML
+# regexes cannot reference each other. Each pattern requires a DB client
+# or driver token in the same command so that grepping source for SQL
+# strings, prose, and coreutils `truncate` do NOT match.
+#
+# POLICY (operator decision, 2026-07): these patterns grade what is
+# VISIBLE in the command text. SQL the hook cannot read — a file
+# (`psql prod -f x.sql`, `< dump.sql`) or an unresolved `$`-variable /
+# `$(…)` payload — is deliberately NOT graded here: a shape-only deny is
+# a guess, and over-blocking has a measured cost to agent task
+# performance. Do not re-add opaque-source patterns. Also not covered:
+# obfuscated/encoded payloads (semantic enforcement's domain).
+
+[[bash.pattern]]
+match = "(?i)(psql|pgcli|mysql|mariadb|mycli|sqlite3|mongosh)[^|&;]*DELETE[[:space:]]+FROM[[:space:]]+(\"[^\"]+\"|`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)([.](\"[^\"]+\"|`[^`]+`|[A-Za-z_][A-Za-z0-9_]*))*[[:space:]]+WHERE[[:space:]]+('?1'?[[:space:]]*=[[:space:]]*'?1'?|true)"
+class = "Catastrophic"
+# DB client + DELETE … WHERE 1=1 (or WHERE true) — tautology full-table
+# wipe. Covers -c payloads, here-strings, and heredocs alike (the SQL text
+# is in the command string in every one of those forms). A real predicate
+# (WHERE id=5) does not match. [^|&;] keeps the client and the SQL in the
+# same shell statement.
+
+[[bash.pattern]]
+match = "(?i)(psql|pgcli|mysql|mariadb|mycli|sqlite3|mongosh)[^|&;]*DELETE[[:space:]]+FROM[[:space:]]+(\"[^\"]+\"|`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)([.](\"[^\"]+\"|`[^`]+`|[A-Za-z_][A-Za-z0-9_]*))*[[:space:]]*(['\"]|\n|$)"
+class = "Catastrophic"
+# DB client + DELETE FROM <table> terminated by a closing quote, a newline
+# (heredoc body line), or end-of-command — a delete-all that dodges the
+# semicolon rule above. A scoped delete continues with " WHERE …" and does
+# not match.
+
+[[bash.pattern]]
+match = "(?i)(echo|printf|cat)[^|]*DELETE[[:space:]]+FROM[[:space:]]+(\"[^\"]+\"|`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)([.](\"[^\"]+\"|`[^`]+`|[A-Za-z_][A-Za-z0-9_]*))*([[:space:]]+WHERE[[:space:]]+('?1'?[[:space:]]*=[[:space:]]*'?1'?|true)|[[:space:]]*['\"])[^|]*\\|[[:space:]]*(psql|pgcli|mysql|mariadb|mycli|sqlite3|mongosh)"
+class = "Catastrophic"
+# echo/printf/cat piping a delete-all (quote-terminated or tautology-WHERE)
+# into a DB client. A scoped delete piped the same way does not match, and
+# an echo WITHOUT the pipe into a client (plain printing) does not match.
+
+[[bash.pattern]]
+match = "(?i)(psql|pgcli|mysql|mariadb|mycli|sqlite3|mongosh)[^|&;]*['\"][[:space:]]*TRUNCATE[[:space:]]+(\"|`|[A-Za-z_])"
+class = "Catastrophic"
+# Quoted TRUNCATE <table> without the TABLE keyword fed directly to a DB
+# client (-c payload / here-string / heredoc); the table may itself be a
+# quoted identifier (`TRUNCATE "orders"`). The leading-quote requirement
+# keeps coreutils `truncate -s 0 file` out.
+
+[[bash.pattern]]
+match = "(?i)(echo|printf|cat)[^|]*TRUNCATE[[:space:]]+(\"|`|[A-Za-z_])[^|]*\\|[[:space:]]*(psql|pgcli|mysql|mariadb|mycli|sqlite3|mongosh)"
+class = "Catastrophic"
+# echo/printf/cat piping a TRUNCATE into a DB client. The pipe into the
+# client is REQUIRED — merely echoing the word TRUNCATE does not match.
+
+[[bash.pattern]]
+match = "(?i)(psycopg2|asyncpg|sqlalchemy|mysql2|pymysql|mysql[.]connector|pymongo|mongoose|sequelize|knex|typeorm|require[(]['\"](pg|mysql2?|mariadb|mongodb)['\"][)])[^|&]*(DELETE[[:space:]]+FROM[[:space:]]+(\"[^\"]+\"|`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)([.](\"[^\"]+\"|`[^`]+`|[A-Za-z_][A-Za-z0-9_]*))*([[:space:]]*['\")]|[[:space:]]+WHERE[[:space:]]+('?1'?[[:space:]]*=[[:space:]]*'?1'?|true))|['\"][[:space:]]*TRUNCATE[[:space:]]+(\"|`|[A-Za-z_])|drop_all|drop_database|drop_collection)"
+class = "Catastrophic"
+# Driver-level destruction in an inline interpreter one-liner
+# (python -c / node -e / ruby -e): a DB driver token plus a delete-all
+# (quote/paren-terminated or tautology-WHERE), a quoted TRUNCATE, or an
+# ORM mass-drop helper (drop_all / drop_database / drop_collection).
+# Merely importing a driver, SELECTs, and scoped deletes do not match.
+
+[[bash.pattern]]
+match = "(?i)['\"](DELETE[[:space:]]+FROM[[:space:]]+(\"[^\"]+\"|`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)([.](\"[^\"]+\"|`[^`]+`|[A-Za-z_][A-Za-z0-9_]*))*([[:space:]]+WHERE[[:space:]]+('?1'?[[:space:]]*=[[:space:]]*'?1'?|true)|[[:space:]]*)|TRUNCATE[[:space:]]+(\"|`|[A-Za-z_])[^'\"]*)['\"].*(psql|pgcli|mysql|mariadb|mycli|sqlite3|mongosh)[^|&]*[$]"
+class = "Catastrophic"
+# Visible destructive payload handed over through a variable in the SAME
+# command: a quoted delete-all / tautology-WHERE / TRUNCATE assignment
+# followed by a client invocation taking a `$` payload
+# (`SQL=\"DELETE FROM orders\"; psql dev -c \"$SQL\"`). Env-agnostic —
+# the destructive text is visible, so target naming does not matter. This
+# is NOT an opaque-payload rule: the statement is readable right there.
+# A scoped assignment (`SQL=\"DELETE FROM x WHERE id=5\"`) does not match.
+
 [[bash.pattern]]
 match = "aws[[:space:]]+s3[[:space:]]+rb[[:space:]]+.*--force"
 class = "Catastrophic"

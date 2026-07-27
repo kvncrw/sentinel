@@ -1093,6 +1093,297 @@ mod tests {
     }
 
     #[test]
+    fn shipped_defaults_bash_herestring_delete_tautology_is_catastrophic() {
+        // 2026-07 evasion class (a): here-string wrapper + tautology WHERE.
+        // No semicolon, so the original `DELETE FROM x;` rule missed it.
+        let c = shipped();
+        for cmd in [
+            "psql prod <<< \"DELETE FROM audit_log WHERE 1=1\"",
+            "mysql staging <<< \"DELETE FROM users WHERE true\"",
+            "psql dev -c \"DELETE FROM sessions WHERE 1 = 1\"",
+        ] {
+            assert_eq!(
+                c.classify("Bash", &bash_cmd(cmd)),
+                ReversibilityClass::Catastrophic,
+                "expected Catastrophic for: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn shipped_defaults_bash_heredoc_delete_all_is_catastrophic() {
+        // Heredoc body: the delete-all ends at a newline, not a quote or `;`.
+        let c = shipped();
+        assert_eq!(
+            c.classify(
+                "Bash",
+                &bash_cmd("psql prod <<EOF\nDELETE FROM audit_log\nEOF")
+            ),
+            ReversibilityClass::Catastrophic
+        );
+    }
+
+    #[test]
+    fn shipped_defaults_bash_echo_pipe_delete_all_is_catastrophic() {
+        let c = shipped();
+        for cmd in [
+            "echo \"DELETE FROM orders\" | psql dev",
+            "echo \"DELETE FROM orders WHERE 1=1\" | mysql app",
+        ] {
+            assert_eq!(
+                c.classify("Bash", &bash_cmd(cmd)),
+                ReversibilityClass::Catastrophic,
+                "expected Catastrophic for: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn shipped_defaults_bash_truncate_without_table_keyword_is_catastrophic() {
+        // `TRUNCATE orders` (no TABLE keyword) dodged the TRUNCATE TABLE rule.
+        let c = shipped();
+        for cmd in [
+            "psql production -c \"TRUNCATE orders\"",
+            "psql prod <<< 'TRUNCATE audit_log'",
+            "echo \"TRUNCATE audit_log\" | psql prod",
+        ] {
+            assert_eq!(
+                c.classify("Bash", &bash_cmd(cmd)),
+                ReversibilityClass::Catastrophic,
+                "expected Catastrophic for: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn shipped_defaults_bash_driver_oneliner_destruction_is_catastrophic() {
+        // 2026-07 evasion class (b): driver-level destruction in an inline
+        // interpreter one-liner.
+        let c = shipped();
+        for cmd in [
+            "python3 -c \"import psycopg2;psycopg2.connect('prod').cursor().execute('DELETE FROM orders')\"",
+            "node -e \"const{Client}=require('pg');new Client().query('DELETE FROM orders')\"",
+            "python3 -c \"from sqlalchemy import create_engine; Base.metadata.drop_all(engine)\"",
+        ] {
+            assert_eq!(
+                c.classify("Bash", &bash_cmd(cmd)),
+                ReversibilityClass::Catastrophic,
+                "expected Catastrophic for: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn shipped_defaults_bash_indirect_target_destruction_is_catastrophic() {
+        // The naming/indirection hole: destructive SQL whose target carries
+        // no prod-name literal (env-var DSN, neutrally-named database). The
+        // prod-scoped db_ops_gate cannot see these; this env-agnostic layer
+        // is the only net, so naked destructive SQL grades Catastrophic
+        // regardless of what the target is called.
+        let c = shipped();
+        for cmd in [
+            "psql \"$DB_URL\" -c \"TRUNCATE orders\"",
+            "python3 -c \"import psycopg2; psycopg2.connect('dbname=maindb').cursor().execute('DELETE FROM orders')\"",
+        ] {
+            assert_eq!(
+                c.classify("Bash", &bash_cmd(cmd)),
+                ReversibilityClass::Catastrophic,
+                "expected Catastrophic for: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn shipped_defaults_bash_indirect_target_reads_and_scoped_ops_pass() {
+        // The same env-var indirection used for reads or scoped deletes must
+        // NOT be graded Catastrophic — indirection alone is not destruction.
+        let c = shipped();
+        for cmd in [
+            "psql \"$DB_URL\" -c \"SELECT count(*) FROM orders;\"",
+            "psql \"$DB_URL\" -c \"DELETE FROM events WHERE id = 5\"",
+        ] {
+            assert_ne!(
+                c.classify("Bash", &bash_cmd(cmd)),
+                ReversibilityClass::Catastrophic,
+                "must NOT be Catastrophic: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn shipped_defaults_bash_opaque_sql_sources_pass_by_policy() {
+        // POLICY (operator decision, 2026-07): SQL this layer cannot READ —
+        // a file, a stdin redirect, an unresolved `$`-variable / `$(…)`
+        // payload — is NOT graded Catastrophic, even on a prod-named
+        // target. A shape-only deny is a guess, and over-blocking has a
+        // measured cost to agent task performance. Pinned as explicit
+        // allow assertions so the denial class is not re-added by accident.
+        let c = shipped();
+        for cmd in [
+            // File / stdin sources — prod-named targets included.
+            "psql prod -f daily_sales_report.sql",
+            "psql -f cleanup.sql prod",
+            "psql production --file=cleanup.sql",
+            "psql production < readonly_export.sql",
+            "mysql -h db.prod.internal < batch.sql",
+            "psql dev -f migration.sql",
+            "psql staging -f cleanup.sql",
+            "psql \"$DB_URL\" -f migration.sql",
+            "mysql app_db < seed.sql",
+            "sqlite3 app.db < seed.sql",
+            "psql preprod -f cleanup.sql",
+            "psql -f report.sql products",
+            // Prod-lookalike / filename / credential words are not targets.
+            "psql nonproduction -f migration.sql",
+            "psql reproduction-svc -f report.sql",
+            "psql staging -f production_report.sql",
+            // Unresolved variable / substitution payloads.
+            "psql prod -c \"$SQL\"",
+            "psql -c \"$SQL\" prod",
+            "psql prod -c \"$(cat cleanup.sql)\"",
+            "mongosh production --eval \"$PAYLOAD\"",
+            "SQL=\"SELECT 1\"; psql prod -c \"$SQL\"",
+            "psql dev -c \"$SQL\"",
+            "mysql staging -e \"$STMT\"",
+            "psql \"$DB_URL\" -c \"$SQL\"",
+        ] {
+            assert_ne!(
+                c.classify("Bash", &bash_cmd(cmd)),
+                ReversibilityClass::Catastrophic,
+                "opaque source must NOT be Catastrophic (policy): {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn shipped_defaults_bash_quoted_identifier_destruction_is_catastrophic() {
+        // Quoted / schema-qualified identifiers (ORM- and pg_dump-shaped
+        // SQL) — the content IS visible, so these are genuine evasions.
+        let c = shipped();
+        for cmd in [
+            "psql prod -c 'TRUNCATE \"orders\"'",
+            "psql dev -c 'DELETE FROM \"public\".\"orders\"'",
+            "psql dev -c 'DELETE FROM \"orders\" WHERE 1=1'",
+            "mysql app -e 'TRUNCATE `sessions`'",
+            "psql dev -c 'DELETE FROM public.orders'",
+        ] {
+            assert_eq!(
+                c.classify("Bash", &bash_cmd(cmd)),
+                ReversibilityClass::Catastrophic,
+                "expected Catastrophic for: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn shipped_defaults_bash_scoped_quoted_identifiers_pass() {
+        // Quoting alone is not destruction.
+        let c = shipped();
+        assert_ne!(
+            c.classify(
+                "Bash",
+                &bash_cmd("psql prod -c 'DELETE FROM \"orders\" WHERE id = 5'")
+            ),
+            ReversibilityClass::Catastrophic
+        );
+    }
+
+    #[test]
+    fn shipped_defaults_bash_visible_payload_with_variables_on_prod_passes() {
+        // A payload that starts with visible, safe SQL is judged by the
+        // text rules — a `$` parameter or a `<` comparison later in the
+        // string must not flip it to opaque/file-sourced.
+        let c = shipped();
+        for cmd in [
+            "psql prod -c \"SELECT count(*) FROM orders WHERE region = $REGION\"",
+            "psql prod -c \"DELETE FROM events WHERE created_at < now() - interval '90 days'\"",
+            "psql prod -c \"SELECT * FROM t WHERE x < $LIMIT\"",
+        ] {
+            assert_ne!(
+                c.classify("Bash", &bash_cmd(cmd)),
+                ReversibilityClass::Catastrophic,
+                "must NOT be Catastrophic: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn shipped_defaults_bash_destructive_assignment_into_client_is_catastrophic() {
+        // Env-agnostic: the destructive text IS visible (same command), the
+        // client consumes it via a variable. Target naming is irrelevant.
+        let c = shipped();
+        for cmd in [
+            "SQL=\"DELETE FROM orders\"; psql dev -c \"$SQL\"",
+            "SQL=\"DELETE FROM orders WHERE 1=1\"; mysql app -e \"$SQL\"",
+            "SQL=\"TRUNCATE orders\"; psql dev -c \"$SQL\"",
+        ] {
+            assert_eq!(
+                c.classify("Bash", &bash_cmd(cmd)),
+                ReversibilityClass::Catastrophic,
+                "expected Catastrophic for: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn shipped_defaults_bash_scoped_assignment_into_client_passes() {
+        // A scoped statement in a variable is legitimate targeted work.
+        let c = shipped();
+        // NOTE the prod variant of a variable-carried SELECT
+        // (`SQL="SELECT …"; psql prod -c "$SQL"`) IS blocked by the
+        // opaque-$-on-prod rule — shape-based rules cannot resolve the
+        // variable. The direct spelling (`psql prod -c "SELECT …"`) passes,
+        // so prod reads always have an allowed path.
+        for cmd in [
+            "SQL=\"DELETE FROM events WHERE id = 5\"; psql dev -c \"$SQL\"",
+            "SQL=\"SELECT count(*) FROM orders\"; psql dev -c \"$SQL\"",
+        ] {
+            assert_ne!(
+                c.classify("Bash", &bash_cmd(cmd)),
+                ReversibilityClass::Catastrophic,
+                "must NOT be Catastrophic: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn shipped_defaults_bash_scoped_db_ops_not_catastrophic() {
+        // The false-positive guard: reads, scoped deletes/updates, dry-run
+        // migrations, import-only driver use, and coreutils truncate must NOT
+        // classify Catastrophic (over-blocking measurably destroys agent task
+        // performance).
+        let c = shipped();
+        for cmd in [
+            "psql prod -c 'SELECT count(*) FROM orders;'",
+            "psql prod -c \"DELETE FROM events WHERE created_at < '2026-01-01'\"",
+            "echo \"DELETE FROM events WHERE id = 5\" | psql dev",
+            "python3 -c \"import psycopg2; print(psycopg2.__version__)\"",
+            "python3 -c \"import psycopg2; psycopg2.connect('dev').cursor().execute('DELETE FROM events WHERE id=%s')\"",
+            "truncate -s 0 /var/log/app.log",
+            "echo \"TRUNCATE audit_log\"",
+            "prisma migrate dev",
+            "sqlx migrate run --dry-run",
+        ] {
+            assert_ne!(
+                c.classify("Bash", &bash_cmd(cmd)),
+                ReversibilityClass::Catastrophic,
+                "must NOT be Catastrophic: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn shipped_defaults_bash_grep_for_sql_stays_trivially_reversible() {
+        // Grepping source for SQL text hits the read-only rule first and must
+        // never be caught by the client/driver-scoped destructive patterns.
+        let c = shipped();
+        assert_eq!(
+            c.classify("Bash", &bash_cmd("grep -r \"DELETE FROM users\" src/")),
+            ReversibilityClass::TriviallyReversible
+        );
+    }
+
+    #[test]
     fn shipped_defaults_bash_force_push_to_main_is_catastrophic() {
         let c = shipped();
         assert_eq!(
