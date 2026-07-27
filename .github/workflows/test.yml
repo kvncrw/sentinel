@@ -46,23 +46,37 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Checkout LangGraph Rust path dependency
-        uses: actions/checkout@v7
-        with:
-          repository: legatus-ai/langgraph-python-to-rust
-          path: langgraph-python-to-rust
-          token: ${{ secrets.LEGATUS_CI_GITHUB_TOKEN }}
-
-      - name: Link LangGraph Rust sibling path
-        run: ln -sfn "$GITHUB_WORKSPACE/langgraph-python-to-rust" "$GITHUB_WORKSPACE/../langgraph-python-to-rust"
-
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
 
-      - name: cargo fmt --all --check
-        run: cargo fmt --all --check
+      # rustfmt directly over OUR sources — deliberately not `cargo fmt --all`.
+      #
+      # `cargo fmt --all` runs `cargo metadata` first, which resolves the whole
+      # dependency graph including SIBLING path-dependency workspaces. sentinel
+      # path-depends on langgraph-python-to-rust, whose own workspace member
+      # `langgraph-api` depends on `cua-brain` from a THIRD repo. CI never checks
+      # that third repo out, so `cargo metadata` failed, `cargo fmt` printed its
+      # usage text and exited non-zero — before formatting a single line. This
+      # job was red on main from 2026-07-25 with no formatting violation in the
+      # tree at all, while build/clippy/test stayed green (they only resolve what
+      # sentinel actually depends on, not the sibling's unrelated members).
+      #
+      # Two properties make this the durable fix rather than checking out a third
+      # repo: formatting is per-file and needs NO dependency resolution, and a
+      # sibling repo's dependency graph can no longer break our style gate. If
+      # those projects want a fmt check, their own CI owns it.
+      #
+      # This also drops the LangGraph checkout from this job — it was only ever
+      # needed to satisfy `cargo metadata`.
+      - name: rustfmt --check (sentinel crates only)
+        run: |
+          set -euo pipefail
+          files=$(find crates -name '*.rs' -not -path '*/target/*' | sort)
+          test -n "$files"   # never pass vacuously on an empty file list
+          echo "$files" | wc -l | xargs echo "checking files:"
+          echo "$files" | xargs rustfmt --check --edition 2021
 
   # ── security: audit + deny (independent, ~1min with pre-built binaries) ─
   # cargo-deny resolves path dependencies to read their Cargo.toml, so the
