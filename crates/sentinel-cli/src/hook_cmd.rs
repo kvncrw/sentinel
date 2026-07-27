@@ -349,22 +349,15 @@ async fn run_internal(event: &str, matcher: Option<&str>) -> Result<()> {
                 );
             }
         };
-    // A13 semantic scorer — required for Catastrophic-class work and
-    // StrictBlocking. Do not let missing scorer env silently make A13 inert.
-    let spec_challenge_scorer: Arc<LlmSpecChallengeScorer> =
-        match LlmSpecChallengeScorer::from_env() {
-            Ok(s) => Arc::new(s),
-            Err(err) => {
-                return write_fail_closed_response(
-                    hook_event,
-                    format!("failed to initialize A13 semantic scorer: {err}"),
-                );
-            }
-        };
-    // A13 enforcement config — shipped default is DefaultBlocking,
-    // overridable via
+    // A13 enforcement config — the intended enterprise baseline remains
+    // DefaultBlocking, but the EMBEDDED shipped mode is temporarily
+    // ObserveOnly: no tool can emit `extra.spec_challenge` yet
+    // (`mcp__sentinel__emit_challenge` does not exist), so a blocking
+    // default would be unsatisfiable (see
+    // config/spec-challenge-defaults.toml). Operators override via
     // ~/.claude/sentinel/config/spec-challenge.toml. Mirrors the
-    // BA1+3 ba-enforcement config below.
+    // BA1+3 ba-enforcement config below. Loaded BEFORE the scorer so
+    // scorer construction can be graded on the effective mode.
     let spec_challenge_overrides_path = config_dir.join("spec-challenge.toml");
     let spec_challenge_config =
         match SpecChallengeConfig::with_shipped_and_overrides(Some(&spec_challenge_overrides_path))
@@ -375,6 +368,30 @@ async fn run_internal(event: &str, matcher: Option<&str>) -> Result<()> {
                     hook_event,
                     format!("spec-challenge.toml load failed: {err}"),
                 );
+            }
+        };
+    // A13 semantic scorer — required for Catastrophic-class work and
+    // StrictBlocking. In blocking modes, do not let missing scorer env
+    // silently make A13 inert: fail closed. In ObserveOnly the gate never
+    // scores and never blocks (spec_challenge_gate.rs short-circuits before
+    // the scorer), so a missing/unconfigurable scorer must NOT deny —
+    // degrade to None with a warning instead of failing closed.
+    let spec_challenge_scorer: Option<Arc<LlmSpecChallengeScorer>> =
+        match LlmSpecChallengeScorer::from_env() {
+            Ok(s) => Some(Arc::new(s)),
+            Err(err) if spec_challenge_config.mode.allows_blocking() => {
+                return write_fail_closed_response(
+                    hook_event,
+                    format!("failed to initialize A13 semantic scorer: {err}"),
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "A13 semantic scorer unavailable; continuing because \
+                     spec_challenge_gate mode is ObserveOnly (never scores, never blocks)"
+                );
+                None
             }
         };
     // Load BA1+3 enforcement config: shipped DefaultBlocking
@@ -454,7 +471,7 @@ async fn run_internal(event: &str, matcher: Option<&str>) -> Result<()> {
                 Some(provenance_store.as_ref()),
                 Some(requirement_matrix.as_ref()),
                 Some(spec_challenge_store.as_ref()),
-                Some(spec_challenge_scorer.as_ref()),
+                spec_challenge_scorer.as_deref(),
                 spec_challenge_config,
                 &ba_enforcement,
                 repo_root_for_metrics.as_deref(),
@@ -1487,10 +1504,12 @@ fn handle_pre_tool_use(
     // Self-gates: TriviallyReversible work skips, ReversibleWithEffort is
     // optional, non-A13 tools without a challenge pass through. The
     // reversibility class is computed from the same classifier the other
-    // gates use. Mode + axis threshold come from spec_challenge_config,
-    // which ships DefaultBlocking. Activating this gate hard-blocks missing
-    // or incomplete Irreversible+ challenges unless an operator explicitly
-    // chooses ObserveOnly for diagnostics.
+    // gates use. Mode + axis threshold come from spec_challenge_config.
+    // The intended enterprise baseline is DefaultBlocking, but the shipped
+    // (embedded) mode is temporarily ObserveOnly because no emit path for
+    // `extra.spec_challenge` exists yet — in a blocking mode the gate
+    // hard-blocks missing or incomplete Irreversible+ challenges, which no
+    // agent could satisfy today (see config/spec-challenge-defaults.toml).
     // Dispatch only when a tool name is present so the classifier has
     // something to key on.
     if let Some(tool) = input.tool_name.as_deref() {

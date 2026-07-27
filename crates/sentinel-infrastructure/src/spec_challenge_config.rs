@@ -17,7 +17,12 @@ use anyhow::{anyhow, Context, Result};
 use sentinel_application::hooks::spec_challenge_gate;
 use serde::Deserialize;
 
-/// Shipped baseline. Hook defaults to `DefaultBlocking`,
+/// Shipped baseline. The intended enterprise baseline remains
+/// `DefaultBlocking`, but the embedded shipped mode is temporarily
+/// `ObserveOnly`: no tool can emit `extra.spec_challenge` yet
+/// (`mcp__sentinel__emit_challenge` does not exist), so a blocking
+/// default would deny unsatisfiably. Restore `DefaultBlocking` in the
+/// shipped TOML once the emit path lands.
 /// `catastrophic_axis_threshold` defaults to `0.7`.
 pub const SHIPPED_SPEC_CHALLENGE_DEFAULTS: &str =
     include_str!("../../../config/spec-challenge-defaults.toml");
@@ -151,15 +156,32 @@ mod tests {
     #[test]
     fn shipped_defaults_parse_cleanly() {
         let config = SpecChallengeConfig::shipped().unwrap();
-        assert_eq!(config.mode, A13EnforcementMode::DefaultBlocking);
+        // Shipped default is temporarily ObserveOnly: DefaultBlocking is
+        // unsatisfiable until `mcp__sentinel__emit_challenge` exists, so the
+        // gate could never be cleared by any agent. Flip back with the config.
+        assert_eq!(config.mode, A13EnforcementMode::ObserveOnly);
         assert!((config.catastrophic_axis_threshold - 0.7).abs() < f32::EPSILON);
     }
 
     #[test]
-    fn default_blocking_constant_matches_shipped() {
+    fn shipped_matches_default_blocking_constant_except_mode() {
+        // The compiled-in `default_blocking()` constant still describes the
+        // intended enterprise baseline; only the shipped MODE is temporarily
+        // relaxed (see config/spec-challenge-defaults.toml). Everything else —
+        // thresholds, axis config — must stay in lockstep, so this still
+        // catches drift between the constant and the shipped file.
         let shipped = SpecChallengeConfig::shipped().unwrap();
         let const_default = SpecChallengeConfig::default_blocking();
-        assert_eq!(shipped, const_default);
+        assert_eq!(shipped.mode, A13EnforcementMode::ObserveOnly);
+        assert_eq!(const_default.mode, A13EnforcementMode::DefaultBlocking);
+        assert_eq!(
+            SpecChallengeConfig {
+                mode: const_default.mode,
+                ..shipped
+            },
+            const_default,
+            "shipped config drifted from default_blocking() beyond the mode"
+        );
     }
 
     #[test]
@@ -251,14 +273,14 @@ mod tests {
     #[test]
     fn with_shipped_and_overrides_none_uses_shipped() {
         let config = SpecChallengeConfig::with_shipped_and_overrides(None).unwrap();
-        assert_eq!(config.mode, A13EnforcementMode::DefaultBlocking);
+        assert_eq!(config.mode, A13EnforcementMode::ObserveOnly);
     }
 
     #[test]
     fn with_shipped_and_overrides_missing_file_uses_shipped() {
         let path = std::path::Path::new("/nonexistent/path/spec-challenge.toml");
         let config = SpecChallengeConfig::with_shipped_and_overrides(Some(path)).unwrap();
-        assert_eq!(config.mode, A13EnforcementMode::DefaultBlocking);
+        assert_eq!(config.mode, A13EnforcementMode::ObserveOnly);
     }
 
     #[test]

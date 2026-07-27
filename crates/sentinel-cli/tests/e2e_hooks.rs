@@ -824,6 +824,57 @@ fn read_tool_is_bare_allow() {
     res.assert_allow();
 }
 
+// ─── A13 spec_challenge_gate: ObserveOnly must never block, even at the ──────
+// engine boundary (scorer construction), and blocking modes must still
+// fail closed on an unconfigurable scorer.
+
+/// Break ONLY the A13 scorer's env: `ollama` is rejected as a direct env
+/// provider by `LlmSpecChallengeScorer::from_env`, so scorer construction
+/// fails, while the harness's dummy `OPENROUTER_API_KEY` keeps the A3
+/// auditor (and everything else) constructible.
+fn break_spec_challenge_scorer_env(t: &mut HookTest) {
+    t.env("SENTINEL_SPEC_CHALLENGE_SCORER_PROVIDER", "ollama");
+}
+
+#[test]
+fn observe_only_spec_gate_allows_when_scorer_unconfigurable() {
+    // Shipped spec-challenge mode is ObserveOnly, which never scores and
+    // never blocks (spec_challenge_gate.rs). A deployment whose scorer env
+    // is missing/unconfigurable must therefore NOT be denied at hook
+    // dispatch: scorer construction may only fail closed when the mode can
+    // actually block. Regression test for the fail-closed-before-mode-check
+    // ordering in hook_cmd.rs.
+    let mut t = HookTest::new();
+    break_spec_challenge_scorer_env(&mut t);
+    let res = t.run(
+        "PreToolUse",
+        json!({"tool_name":"Read","tool_input":{"file_path":"/tmp/x"},
+               "cwd": t.home_path().to_string_lossy()}),
+    );
+    res.assert_allow();
+}
+
+#[test]
+fn blocking_spec_gate_still_fails_closed_when_scorer_unconfigurable() {
+    // With an operator override selecting DefaultBlocking, an
+    // unconfigurable scorer must still fail closed at dispatch — the
+    // enforcing gate must not silently run inert without its scorer.
+    let mut t = HookTest::new();
+    break_spec_challenge_scorer_env(&mut t);
+    let config_dir = t.claude_dir().join("sentinel").join("config");
+    std::fs::write(
+        config_dir.join("spec-challenge.toml"),
+        "[spec_challenge_gate]\nmode = \"DefaultBlocking\"\n",
+    )
+    .expect("write spec-challenge override");
+    let res = t.run(
+        "PreToolUse",
+        json!({"tool_name":"Read","tool_input":{"file_path":"/tmp/x"},
+               "cwd": t.home_path().to_string_lossy()}),
+    );
+    res.assert_deny("A13 semantic scorer");
+}
+
 // ─── Reality-check / work-assurance: the F1 scenario, now driven E2E ─────────
 
 #[test]

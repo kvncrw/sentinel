@@ -25,7 +25,21 @@
 #   shallow alternatives or fake-empty categories is unacceptable.
 
 [spec_challenge_gate]
-mode = "DefaultBlocking"
+# TEMPORARILY ObserveOnly (2026-07-25) — NOT a judgement on A13's design.
+#
+# `DefaultBlocking` is unsatisfiable as shipped: the gate requires a
+# SpecChallenge artifact in `HookInput.extra.spec_challenge`, but the tool that
+# would let an agent submit one — `mcp__sentinel__emit_challenge` — does not
+# exist. It appears only in docs/a13-spec-challenge.md, where §14 lists building
+# it as something *ratification would commit to*. That signature block is still
+# blank. So enforcement shipped without its delivery mechanism, and an agent
+# hitting this gate cannot get past it by any means.
+#
+# Restore `DefaultBlocking` as soon as the emit path exists. ObserveOnly keeps
+# the completeness check and still logs every would-be block, so no telemetry
+# is lost in the meantime.
+
+mode = "ObserveOnly"
 
 # Minimum per-axis score (0.0-1.0) the scorer must return for a
 # Catastrophic-class challenge to pass. Operators tune this per
