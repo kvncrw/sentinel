@@ -28,6 +28,11 @@
 //!   - Notably does NOT require `OPENROUTER_API_KEY` — local seats run
 //!     without any OpenRouter credentials.
 //!
+//! Empty / whitespace-only values count as unset for the provider, model,
+//! key, and `OLLAMA_*` vars (`llm_scorer_runtime::env_non_empty`) — `VAR=""`
+//! behaves exactly like the var being absent. (`*_TIMEOUT_SECS` keeps its
+//! stricter contract: set-but-empty is a hard config error.)
+//!
 //! ## What the judge scores
 //!
 //! NOT completeness — that's the deterministic floor handled by
@@ -53,8 +58,8 @@ use sentinel_domain::ports::{
 use sentinel_domain::spec_challenge::SpecChallenge;
 
 use crate::llm_scorer_runtime::{
-    self, build_ollama_prompt_fn, build_openrouter_prompt_fn, preview, read_timeout, real_env,
-    sidecar, strip_code_fence, PromptFn,
+    self, build_ollama_prompt_fn, build_openrouter_prompt_fn, env_non_empty, preview, read_timeout,
+    real_env, sidecar, strip_code_fence, PromptFn,
 };
 
 pub const DEFAULT_SCORER_PROVIDER: &str = "openrouter";
@@ -124,7 +129,9 @@ impl LlmSpecChallengeScorer {
     where
         F: Fn(&str) -> Option<String>,
     {
-        let provider = env("SENTINEL_SPEC_CHALLENGE_SCORER_PROVIDER")
+        // Empty/whitespace-only provider counts as unset → default provider
+        // (uniform empty-env semantics; see `env_non_empty`).
+        let provider = env_non_empty(&env, "SENTINEL_SPEC_CHALLENGE_SCORER_PROVIDER")
             .unwrap_or_else(|| DEFAULT_SCORER_PROVIDER.to_string())
             .to_lowercase();
         match provider.as_str() {
@@ -141,10 +148,13 @@ impl LlmSpecChallengeScorer {
     where
         F: Fn(&str) -> Option<String>,
     {
-        let key = env("OPENROUTER_API_KEY").context(
+        // Empty values count as unset: an empty key errors like a missing one
+        // instead of building a client with an empty bearer, and an empty
+        // model falls back to the default.
+        let key = env_non_empty(&env, "OPENROUTER_API_KEY").context(
             "OPENROUTER_API_KEY not set (required for openrouter spec-challenge scorer)",
         )?;
-        let model_id = env("SENTINEL_SPEC_CHALLENGE_SCORER_MODEL")
+        let model_id = env_non_empty(&env, "SENTINEL_SPEC_CHALLENGE_SCORER_MODEL")
             .unwrap_or_else(|| DEFAULT_SCORER_OPENROUTER_MODEL.to_string());
         let timeout = read_timeout(
             &env,
@@ -165,7 +175,9 @@ impl LlmSpecChallengeScorer {
     where
         F: Fn(&str) -> Option<String>,
     {
-        let model_id = env("SENTINEL_SPEC_CHALLENGE_SCORER_MODEL").context(
+        // Empty value counts as unset — the model is required for ollama, so
+        // MODEL="" errors identically to the var being absent.
+        let model_id = env_non_empty(&env, "SENTINEL_SPEC_CHALLENGE_SCORER_MODEL").context(
             "SENTINEL_SPEC_CHALLENGE_SCORER_MODEL not set (required for ollama \
              spec-challenge scorer; no sensible default — pick what you serve)",
         )?;
@@ -550,6 +562,47 @@ mod tests {
         })
         .expect("openrouter provider should construct");
         assert_eq!(scorer.model_id, "openai/gpt-5.5-pro");
+    }
+
+    /// An EMPTY provider var falls back to the default (openrouter) instead
+    /// of being dispatched as the provider `""` (unknown-provider error).
+    #[test]
+    fn from_env_empty_provider_falls_back_to_default() {
+        let scorer = LlmSpecChallengeScorer::from_env_with(|key| match key {
+            "SENTINEL_SPEC_CHALLENGE_SCORER_PROVIDER" => Some(String::new()),
+            "OPENROUTER_API_KEY" => Some("fake-key".to_string()),
+            _ => None,
+        })
+        .expect("empty provider must fall back to default openrouter");
+        assert_eq!(scorer.provider_prefix, "openrouter");
+    }
+
+    /// An EMPTY `OPENROUTER_API_KEY` errors exactly like a missing one — it
+    /// must never build a client with an empty bearer token.
+    #[test]
+    fn openrouter_from_env_empty_api_key_errors_as_unset() {
+        let result = LlmSpecChallengeScorer::openrouter_from_env_with(|key| match key {
+            "OPENROUTER_API_KEY" => Some(String::new()),
+            _ => None,
+        });
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("OPENROUTER_API_KEY"), "{err}");
+    }
+
+    /// An EMPTY model var errors like a missing one on the ollama path (the
+    /// model is required there).
+    #[test]
+    fn from_env_ollama_empty_model_errors_as_unset() {
+        let result = LlmSpecChallengeScorer::from_env_with(|key| match key {
+            "SENTINEL_SPEC_CHALLENGE_SCORER_PROVIDER" => Some("ollama".to_string()),
+            "SENTINEL_SPEC_CHALLENGE_SCORER_MODEL" => Some("   ".to_string()),
+            _ => None,
+        });
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("SENTINEL_SPEC_CHALLENGE_SCORER_MODEL"),
+            "{err}"
+        );
     }
 
     /// Missing key error names both the exact env var and the provider.

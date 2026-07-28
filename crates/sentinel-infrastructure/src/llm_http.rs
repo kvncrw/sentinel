@@ -102,6 +102,9 @@ impl ChatClient {
         }
 
         let url = format!("{}/chat/completions", self.base_url);
+        // Error strings surface in logs and fail-closed hook responses — never
+        // embed the raw URL, which may carry `user:pass@` userinfo.
+        let url_display = redact_url_userinfo(&url);
         let resp = self
             .http
             .post(&url)
@@ -109,19 +112,19 @@ impl ChatClient {
             .json(&body)
             .send()
             .await
-            .with_context(|| format!("chat request to {url} failed to send"))?;
+            .with_context(|| format!("chat request to {url_display} failed to send"))?;
 
         let status = resp.status();
         if !status.is_success() {
             let snippet = resp.text().await.unwrap_or_default();
             let snippet = truncate(&snippet, 500);
-            anyhow::bail!("chat request to {url} returned {status}: {snippet}");
+            anyhow::bail!("chat request to {url_display} returned {status}: {snippet}");
         }
 
         let parsed: ChatResponse = resp
             .json()
             .await
-            .with_context(|| format!("failed to decode chat response from {url}"))?;
+            .with_context(|| format!("failed to decode chat response from {url_display}"))?;
 
         parsed
             .choices
@@ -155,6 +158,37 @@ struct ResponseMessage {
     /// Absent/null content (e.g. a pure tool-call response) decodes to empty.
     #[serde(default)]
     content: String,
+}
+
+/// Redact the userinfo component (`user:pass@`) of a URL for safe inclusion
+/// in error messages and logs.
+///
+/// Operator-supplied base URLs (`OLLAMA_BASE_URL`, custom OpenAI-compatible
+/// endpoints) may embed credentials in the authority; error strings from this
+/// module end up in A13 ObserveOnly warnings and fail-closed hook responses,
+/// so the userinfo is replaced with `***` before formatting. Only the
+/// authority section (between `://` and the first `/`, `?`, or `#`) is
+/// inspected — an `@` later in the path or query is left alone.
+pub fn redact_url_userinfo(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let authority_start = scheme_end + 3;
+    let rest = &url[authority_start..];
+    let authority_end = rest
+        .find(['/', '?', '#'])
+        .map_or(url.len(), |i| authority_start + i);
+    let authority = &url[authority_start..authority_end];
+    // rfind: RFC 3986 permits ':'/'@'-ish chars in userinfo; the LAST '@'
+    // in the authority separates userinfo from host.
+    match authority.rfind('@') {
+        Some(at) => format!(
+            "{}***@{}",
+            &url[..authority_start],
+            &url[authority_start + at + 1..]
+        ),
+        None => url.to_string(),
+    }
 }
 
 /// Truncate a string to `max` bytes on a char boundary, appending `…` when cut.
@@ -241,6 +275,67 @@ mod tests {
         let raw = serde_json::json!({ "choices": [{ "message": { "role": "assistant" } }] });
         let parsed: ChatResponse = serde_json::from_value(raw).unwrap();
         assert_eq!(parsed.choices[0].message.content, "");
+    }
+
+    // -----------------------------------------------------------------------
+    // redact_url_userinfo
+    // -----------------------------------------------------------------------
+
+    /// Embedded `user:pass@` credentials are replaced with `***@`.
+    #[test]
+    fn redact_url_userinfo_strips_embedded_credentials() {
+        let url = "http://alice:s3cr3t-t0ken@vllm.example:8000/v1/chat/completions";
+        let redacted = redact_url_userinfo(url);
+        assert_eq!(redacted, "http://***@vllm.example:8000/v1/chat/completions");
+        assert!(!redacted.contains("s3cr3t"), "{redacted}");
+        assert!(!redacted.contains("alice"), "{redacted}");
+    }
+
+    /// A URL without userinfo passes through unchanged.
+    #[test]
+    fn redact_url_userinfo_passthrough_without_credentials() {
+        let url = "http://172.16.100.195:8000/v1/chat/completions";
+        assert_eq!(redact_url_userinfo(url), url);
+    }
+
+    /// An `@` in the path or query is NOT treated as userinfo.
+    #[test]
+    fn redact_url_userinfo_ignores_at_in_path_and_query() {
+        let path = "https://host.example/v1/users/@me/chat";
+        assert_eq!(redact_url_userinfo(path), path);
+        let query = "https://host.example/v1/chat?mention=@op";
+        assert_eq!(redact_url_userinfo(query), query);
+    }
+
+    /// Userinfo containing an extra `@` (percent-encoding not enforced) still
+    /// redacts up to the LAST `@` in the authority.
+    #[test]
+    fn redact_url_userinfo_handles_at_inside_userinfo() {
+        let url = "http://user@corp:pw@host:9/v1";
+        assert_eq!(redact_url_userinfo(url), "http://***@host:9/v1");
+    }
+
+    /// Token-only userinfo (no colon) is also redacted.
+    #[test]
+    fn redact_url_userinfo_redacts_bare_token_userinfo() {
+        let url = "https://sk-live-token@ollama.com/v1";
+        assert_eq!(redact_url_userinfo(url), "https://***@ollama.com/v1");
+    }
+
+    /// Non-URL strings (no scheme) are returned unchanged.
+    #[test]
+    fn redact_url_userinfo_passthrough_non_url() {
+        assert_eq!(redact_url_userinfo("not a url"), "not a url");
+        assert_eq!(redact_url_userinfo(""), "");
+    }
+
+    /// Authority-only URL (no path) with credentials is redacted.
+    #[test]
+    fn redact_url_userinfo_authority_only() {
+        assert_eq!(
+            redact_url_userinfo("http://u:p@host:8000"),
+            "http://***@host:8000"
+        );
     }
 
     #[test]

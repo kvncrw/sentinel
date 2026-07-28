@@ -23,6 +23,29 @@ next component doesn't reproduce the same class of failure.
 | **Transport layer** (`ChatClient`) | `crates/sentinel-infrastructure/src/llm_http.rs` | n/a — takes `base_url` + `key` as arguments; `openrouter()` is `openai_compat(OPENROUTER_BASE_URL, key)` | none directly | n/a | n/a — this is the one layer that is already uniform |
 | **Shared scorer plumbing** | `crates/sentinel-infrastructure/src/llm_scorer_runtime.rs` | `build_openrouter_prompt_fn` / `build_ollama_prompt_fn` (+ `resolve_ollama_endpoint`) | `OLLAMA_API_KEY`, `OLLAMA_BASE_URL`, `OLLAMA_HOST` | n/a | Construction `Err` propagated to caller |
 
+### Behavior changes shipped with this audit (upgrading operators, read this)
+
+Two semantics changes landed in the shared plumbing alongside the A13
+promotion — both apply to **every** consumer of `build_ollama_prompt_fn`
+(A3 auditor router path, A13 scorer), not just A13:
+
+1. **`OLLAMA_BASE_URL` now beats `OLLAMA_HOST` in keyless mode.** Previously
+   keyless mode ignored `OLLAMA_BASE_URL` entirely and used `OLLAMA_HOST`+`/v1`.
+   Now: `OLLAMA_BASE_URL` verbatim → `OLLAMA_HOST`+`/v1` → localhost default.
+   A deployment setting BOTH vars keyless reroutes from the host to the base
+   URL on upgrade; a one-line `warn!` (userinfo-redacted URLs) fires whenever
+   both are set so the precedence is visible.
+2. **Empty / whitespace-only env values count as unset** for the provider-
+   resolution vars (`env_non_empty`): `OLLAMA_BASE_URL=""` falls through to
+   `OLLAMA_HOST`; `OLLAMA_API_KEY=""` stays keyless (no more cloud mode with
+   an empty bearer); empty A13 provider → default provider; empty A13
+   key/model → same error as missing. Exception: set-but-empty
+   `*_TIMEOUT_SECS` remains a hard config error (pre-existing contract).
+
+Related hardening: `ChatClient` error strings redact URL userinfo
+(`redact_url_userinfo`) so config-embedded credentials cannot leak into
+ObserveOnly logs or fail-closed hook responses.
+
 Non-LLM env consumers checked and excluded: `linear_lookup` / `linear_enforcer`
 (`LINEAR_API_KEY`), `memory_provision` (`QDRANT_API_KEY`), `mcp_guardian`
 (secret-reference healing), `evidence_browserbase`.

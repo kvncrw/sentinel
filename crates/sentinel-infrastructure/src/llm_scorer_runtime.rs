@@ -79,6 +79,26 @@ pub fn real_env(key: &str) -> Option<String> {
     std::env::var(key).ok()
 }
 
+/// Read `key` from the resolver, treating **empty or whitespace-only values
+/// as unset** (returns `None`). The returned value is trimmed.
+///
+/// Rationale: `VAR=""` in a wrapper script or CI matrix is an operator saying
+/// "not configured", not "configured to the empty string". Without this,
+/// `OLLAMA_BASE_URL=""` suppressed a valid `OLLAMA_HOST`, and
+/// `OLLAMA_API_KEY=""` selected cloud mode with an empty bearer token.
+///
+/// NOTE: `read_timeout` deliberately does NOT use this — a set-but-empty
+/// `*_TIMEOUT_SECS` stays a hard config error (documented, tested contract)
+/// rather than silently falling back to the default.
+pub fn env_non_empty<F>(env: &F, key: &str) -> Option<String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    env(key)
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
 /// Read a `<namespace>_TIMEOUT_SECS` variable from the supplied env resolver.
 ///
 /// Absence uses `default`. Set-but-empty, zero, or malformed values are config
@@ -296,19 +316,39 @@ pub fn build_openrouter_prompt_fn(
 ///    `"ollama-local"`.
 /// 3. Keyless, no base URL → `OLLAMA_HOST` (default
 ///    `http://localhost:11434`) with `/v1` appended, `"ollama-local"`.
+///
+/// Empty / whitespace-only values count as unset for all three vars
+/// ([`env_non_empty`]). When both `OLLAMA_BASE_URL` and `OLLAMA_HOST` are
+/// set keyless, `OLLAMA_BASE_URL` wins and a one-line warning makes the
+/// precedence visible.
 fn resolve_ollama_endpoint<F>(env: &F) -> (String, String, String)
 where
     F: Fn(&str) -> Option<String>,
 {
-    env("OLLAMA_API_KEY").map_or_else(
+    // Empty/whitespace-only values are "unset" for every var here (see
+    // `env_non_empty`): an empty OLLAMA_API_KEY must not select cloud mode
+    // with an empty bearer, and an empty OLLAMA_BASE_URL must not suppress a
+    // valid OLLAMA_HOST.
+    env_non_empty(env, "OLLAMA_API_KEY").map_or_else(
         || {
             // Local mode: honor an explicit OLLAMA_BASE_URL first — it is
             // used verbatim, so it can point at ANY OpenAI-compatible /v1
             // endpoint (vLLM, litellm, ollama). Only fall back to the
             // host-plus-appended-/v1 form when no base URL is given.
-            let base = env("OLLAMA_BASE_URL").unwrap_or_else(|| {
-                let host =
-                    env("OLLAMA_HOST").unwrap_or_else(|| "http://localhost:11434".to_string());
+            let base_url = env_non_empty(env, "OLLAMA_BASE_URL");
+            let host = env_non_empty(env, "OLLAMA_HOST");
+            if let (Some(base), Some(host)) = (&base_url, &host) {
+                // Cross-component precedence notice: BASE_URL beats HOST for
+                // every consumer of this plumbing (A3 auditor router path,
+                // A13 scorer). Make the reroute visible, never silent.
+                warn!(
+                    base_url = %crate::llm_http::redact_url_userinfo(base),
+                    ignored_host = %crate::llm_http::redact_url_userinfo(host),
+                    "OLLAMA_BASE_URL and OLLAMA_HOST are both set; OLLAMA_BASE_URL wins and is used verbatim"
+                );
+            }
+            let base = base_url.unwrap_or_else(|| {
+                let host = host.unwrap_or_else(|| "http://localhost:11434".to_string());
                 format!("{}/v1", host.trim_end_matches('/'))
             });
             (
@@ -318,8 +358,8 @@ where
             )
         },
         |key| {
-            let base =
-                env("OLLAMA_BASE_URL").unwrap_or_else(|| DEFAULT_OLLAMA_CLOUD_BASE_URL.to_string());
+            let base = env_non_empty(env, "OLLAMA_BASE_URL")
+                .unwrap_or_else(|| DEFAULT_OLLAMA_CLOUD_BASE_URL.to_string());
             (base, key, "ollama-cloud".to_string())
         },
     )
@@ -833,6 +873,74 @@ mod tests {
         };
         let (base, _, _) = resolve_ollama_endpoint(&env);
         assert_eq!(base, "http://vllm.example:8000/v1");
+    }
+
+    // -----------------------------------------------------------------------
+    // env_non_empty — empty/whitespace values are unset
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn env_non_empty_returns_trimmed_value() {
+        let env = |_: &str| Some("  qwen3:8b  ".to_string());
+        assert_eq!(env_non_empty(&env, "VAR"), Some("qwen3:8b".to_string()));
+    }
+
+    #[test]
+    fn env_non_empty_treats_empty_and_whitespace_as_unset() {
+        let empty = |_: &str| Some(String::new());
+        assert_eq!(env_non_empty(&empty, "VAR"), None);
+        let ws = |_: &str| Some("   \t ".to_string());
+        assert_eq!(env_non_empty(&ws, "VAR"), None);
+        let absent = |_: &str| None;
+        assert_eq!(env_non_empty(&absent, "VAR"), None);
+    }
+
+    /// An EMPTY `OLLAMA_BASE_URL` must not suppress a valid `OLLAMA_HOST` —
+    /// it counts as unset and resolution falls through to the host.
+    #[test]
+    fn resolve_ollama_endpoint_empty_base_url_falls_through_to_host() {
+        let env = |k: &str| -> Option<String> {
+            match k {
+                "OLLAMA_BASE_URL" => Some(String::new()),
+                "OLLAMA_HOST" => Some("http://10.0.0.5:11434".to_string()),
+                _ => None,
+            }
+        };
+        let (base, _, prefix) = resolve_ollama_endpoint(&env);
+        assert_eq!(base, "http://10.0.0.5:11434/v1");
+        assert_eq!(prefix, "ollama-local");
+    }
+
+    /// An EMPTY `OLLAMA_API_KEY` must stay keyless (local mode), never cloud
+    /// mode with an empty bearer token.
+    #[test]
+    fn resolve_ollama_endpoint_empty_api_key_stays_keyless() {
+        let env = |k: &str| -> Option<String> {
+            match k {
+                "OLLAMA_API_KEY" => Some(String::new()),
+                _ => None,
+            }
+        };
+        let (base, key, prefix) = resolve_ollama_endpoint(&env);
+        assert_eq!(prefix, "ollama-local");
+        assert_eq!(key, OLLAMA_LOCAL_DUMMY_KEY);
+        assert_eq!(base, "http://localhost:11434/v1");
+    }
+
+    /// Whitespace-only values behave identically to empty ones.
+    #[test]
+    fn resolve_ollama_endpoint_whitespace_values_are_unset() {
+        let env = |k: &str| -> Option<String> {
+            match k {
+                "OLLAMA_API_KEY" => Some("  ".to_string()),
+                "OLLAMA_BASE_URL" => Some("\t".to_string()),
+                "OLLAMA_HOST" => None,
+                _ => None,
+            }
+        };
+        let (base, _, prefix) = resolve_ollama_endpoint(&env);
+        assert_eq!(prefix, "ollama-local");
+        assert_eq!(base, "http://localhost:11434/v1");
     }
 
     /// With `OLLAMA_API_KEY` → cloud mode, real key, cloud default base URL.
