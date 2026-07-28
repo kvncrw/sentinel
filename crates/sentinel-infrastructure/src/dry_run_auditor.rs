@@ -150,10 +150,12 @@ impl RigAuditor {
     ///   `OLLAMA_BASE_URL` (default [`DEFAULT_OLLAMA_CLOUD_BASE_URL`])
     ///   with bearer auth via rig-core's `openai` provider (Ollama
     ///   Cloud exposes an OpenAI-compatible endpoint).
-    /// - Otherwise → **local Ollama**. Uses `OLLAMA_HOST` (default
-    ///   `http://localhost:11434`) — `/v1` is appended for the `OpenAI`-
-    ///   compatible path; a dummy bearer token is sent because local
-    ///   Ollama's `OpenAI`-compat endpoint ignores it.
+    /// - Otherwise → **local mode**. Uses `OLLAMA_BASE_URL` verbatim
+    ///   when set (any OpenAI-compatible `/v1` endpoint — vLLM,
+    ///   litellm, ollama); else `OLLAMA_HOST` (default
+    ///   `http://localhost:11434`) with `/v1` appended for the
+    ///   `OpenAI`-compatible path. A dummy bearer token is sent because
+    ///   local `OpenAI`-compat endpoints ignore it.
     ///
     /// `SENTINEL_AUDITOR_MODEL` is **required** for Ollama (no sensible
     /// default — operators choose what they've pulled).

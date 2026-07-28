@@ -19,9 +19,10 @@
 //! - `strip_code_fence` — strip ```` ```json ```` / ```` ``` ```` wrappers
 //!   that models sometimes emit despite instructions not to.
 //! - `preview` — truncate a string for error messages.
-//! - `build_rig_prompt_fn` — construct the openrouter / ollama-local /
-//!   ollama-cloud `PromptFn` from environment, returning both the
-//!   function and the `provider_prefix` string.
+//! - `build_openrouter_prompt_fn` / `build_ollama_prompt_fn` — construct
+//!   the openrouter / ollama-local / ollama-cloud `PromptFn` from
+//!   environment, returning both the function and the `provider_prefix`
+//!   string.
 //!
 //! ## Preserved invariant: nested-runtime safety (fix #18)
 //!
@@ -282,15 +283,65 @@ pub fn build_openrouter_prompt_fn(
     Ok((prompt_fn, "openrouter".to_string()))
 }
 
-/// Build a `PromptFn` that routes to Ollama (local or cloud), auto-
-/// detecting which mode to use from the env resolver.
+/// Resolve the Ollama-style endpoint from the env resolver.
 ///
-/// - If `OLLAMA_API_KEY` is set → **Ollama Cloud**. Uses
+/// Returns `(base_url, api_key, provider_prefix)`. Extracted from
+/// [`build_ollama_prompt_fn`] so the resolution order is directly unit-
+/// testable:
+///
+/// 1. `OLLAMA_API_KEY` set → cloud mode: `OLLAMA_BASE_URL` (default
+///    [`DEFAULT_OLLAMA_CLOUD_BASE_URL`]), bearer auth, `"ollama-cloud"`.
+/// 2. Keyless + `OLLAMA_BASE_URL` set → that URL **verbatim** (point it at
+///    any OpenAI-compatible `/v1` root: vLLM, litellm, ollama),
+///    `"ollama-local"`.
+/// 3. Keyless, no base URL → `OLLAMA_HOST` (default
+///    `http://localhost:11434`) with `/v1` appended, `"ollama-local"`.
+fn resolve_ollama_endpoint<F>(env: &F) -> (String, String, String)
+where
+    F: Fn(&str) -> Option<String>,
+{
+    env("OLLAMA_API_KEY").map_or_else(
+        || {
+            // Local mode: honor an explicit OLLAMA_BASE_URL first — it is
+            // used verbatim, so it can point at ANY OpenAI-compatible /v1
+            // endpoint (vLLM, litellm, ollama). Only fall back to the
+            // host-plus-appended-/v1 form when no base URL is given.
+            let base = env("OLLAMA_BASE_URL").unwrap_or_else(|| {
+                let host =
+                    env("OLLAMA_HOST").unwrap_or_else(|| "http://localhost:11434".to_string());
+                format!("{}/v1", host.trim_end_matches('/'))
+            });
+            (
+                base,
+                OLLAMA_LOCAL_DUMMY_KEY.to_string(),
+                "ollama-local".to_string(),
+            )
+        },
+        |key| {
+            let base =
+                env("OLLAMA_BASE_URL").unwrap_or_else(|| DEFAULT_OLLAMA_CLOUD_BASE_URL.to_string());
+            (base, key, "ollama-cloud".to_string())
+        },
+    )
+}
+
+/// Build a `PromptFn` that routes to an Ollama-style **OpenAI-compatible
+/// chat-completions endpoint** (local daemon, vLLM, litellm, or Ollama
+/// Cloud), auto-detecting which mode to use from the env resolver.
+///
+/// The wire protocol is always OpenAI-compatible `/chat/completions`
+/// (via [`ChatClient::openai_compat`]) — never Ollama's native
+/// `/api/generate` — so any `/v1` server works (vLLM and litellm are
+/// first-class targets, not just the ollama daemon).
+///
+/// - If `OLLAMA_API_KEY` is set → **cloud / authenticated mode**. Uses
 ///   `OLLAMA_BASE_URL` (default [`DEFAULT_OLLAMA_CLOUD_BASE_URL`]) with
-///   bearer auth via rig-core's `openai` provider.
-/// - Otherwise → **local Ollama**. Uses `OLLAMA_HOST` (default
-///   `http://localhost:11434`); `/v1` is appended; a dummy bearer token
-///   is sent because local Ollama's OpenAI-compat endpoint ignores it.
+///   bearer auth.
+/// - Otherwise → **local mode**. Uses `OLLAMA_BASE_URL` verbatim when
+///   set (point it at any OpenAI-compatible `/v1` root, e.g. a vLLM
+///   serve); else `OLLAMA_HOST` (default `http://localhost:11434`) with
+///   `/v1` appended. A dummy bearer token is sent because local
+///   OpenAI-compat endpoints ignore it.
 ///
 /// Returns `(PromptFn, provider_prefix)` where `provider_prefix` is
 /// `"ollama-cloud"` or `"ollama-local"`.
@@ -303,22 +354,7 @@ pub fn build_ollama_prompt_fn<F>(env: &F, scorer_label: &'static str) -> Result<
 where
     F: Fn(&str) -> Option<String>,
 {
-    let (base_url, api_key, provider_prefix) = env("OLLAMA_API_KEY").map_or_else(
-        || {
-            let host = env("OLLAMA_HOST").unwrap_or_else(|| "http://localhost:11434".to_string());
-            let base = format!("{}/v1", host.trim_end_matches('/'));
-            (
-                base,
-                OLLAMA_LOCAL_DUMMY_KEY.to_string(),
-                "ollama-local".to_string(),
-            )
-        },
-        |key| {
-            let base =
-                env("OLLAMA_BASE_URL").unwrap_or_else(|| DEFAULT_OLLAMA_CLOUD_BASE_URL.to_string());
-            (base, key, "ollama-cloud".to_string())
-        },
-    );
+    let (base_url, api_key, provider_prefix) = resolve_ollama_endpoint(env);
 
     let client = ChatClient::openai_compat(&base_url, &api_key)
         .map_err(|e| anyhow::anyhow!("failed to build ollama client (base_url={base_url}): {e}"))?;
@@ -738,6 +774,79 @@ mod tests {
         };
         let (_, prefix) = build_ollama_prompt_fn(&env, "scorer")
             .unwrap_or_else(|e| panic!("custom OLLAMA_BASE_URL should be accepted: {e}"));
+        assert_eq!(prefix, "ollama-cloud");
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_ollama_endpoint — base URL resolution order
+    // -----------------------------------------------------------------------
+
+    /// Keyless + `OLLAMA_BASE_URL` → the URL is used VERBATIM (no `/v1`
+    /// appended, no localhost fallback). This is the vLLM/litellm seat:
+    /// the consumer points straight at an OpenAI-compatible `/v1` root.
+    #[test]
+    fn resolve_ollama_endpoint_keyless_base_url_used_verbatim() {
+        let env = |k: &str| -> Option<String> {
+            match k {
+                "OLLAMA_BASE_URL" => Some("http://172.16.100.195:8000/v1".to_string()),
+                _ => None,
+            }
+        };
+        let (base, key, prefix) = resolve_ollama_endpoint(&env);
+        assert_eq!(base, "http://172.16.100.195:8000/v1");
+        assert_eq!(key, OLLAMA_LOCAL_DUMMY_KEY);
+        assert_eq!(prefix, "ollama-local");
+    }
+
+    /// Keyless, no base URL → `OLLAMA_HOST` with `/v1` appended.
+    #[test]
+    fn resolve_ollama_endpoint_keyless_host_gets_v1_appended() {
+        let env = |k: &str| -> Option<String> {
+            match k {
+                "OLLAMA_HOST" => Some("http://10.0.0.5:11434/".to_string()),
+                _ => None,
+            }
+        };
+        let (base, _, prefix) = resolve_ollama_endpoint(&env);
+        assert_eq!(base, "http://10.0.0.5:11434/v1");
+        assert_eq!(prefix, "ollama-local");
+    }
+
+    /// Keyless, nothing set → localhost daemon default.
+    #[test]
+    fn resolve_ollama_endpoint_keyless_defaults_to_localhost() {
+        let env = |_: &str| -> Option<String> { None };
+        let (base, _, prefix) = resolve_ollama_endpoint(&env);
+        assert_eq!(base, "http://localhost:11434/v1");
+        assert_eq!(prefix, "ollama-local");
+    }
+
+    /// `OLLAMA_BASE_URL` wins over `OLLAMA_HOST` when both are set keyless.
+    #[test]
+    fn resolve_ollama_endpoint_base_url_wins_over_host() {
+        let env = |k: &str| -> Option<String> {
+            match k {
+                "OLLAMA_BASE_URL" => Some("http://vllm.example:8000/v1".to_string()),
+                "OLLAMA_HOST" => Some("http://ignored:11434".to_string()),
+                _ => None,
+            }
+        };
+        let (base, _, _) = resolve_ollama_endpoint(&env);
+        assert_eq!(base, "http://vllm.example:8000/v1");
+    }
+
+    /// With `OLLAMA_API_KEY` → cloud mode, real key, cloud default base URL.
+    #[test]
+    fn resolve_ollama_endpoint_cloud_mode_with_key() {
+        let env = |k: &str| -> Option<String> {
+            match k {
+                "OLLAMA_API_KEY" => Some("real-key".to_string()),
+                _ => None,
+            }
+        };
+        let (base, key, prefix) = resolve_ollama_endpoint(&env);
+        assert_eq!(base, DEFAULT_OLLAMA_CLOUD_BASE_URL);
+        assert_eq!(key, "real-key");
         assert_eq!(prefix, "ollama-cloud");
     }
 

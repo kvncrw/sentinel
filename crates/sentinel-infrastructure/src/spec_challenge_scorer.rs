@@ -5,15 +5,28 @@
 //! that asks the model to rate the 5 categories on `[0.0, 1.0]`,
 //! parses the JSON response into a [`SpecChallengeScore`].
 //!
-//! ## Direct Env Provider
+//! ## Direct Env Providers
 //!
-//! `from_env()` is OpenRouter-only. Env namespace is distinct from A3 / A12 so
+//! `from_env()` dispatches on `SENTINEL_SPEC_CHALLENGE_SCORER_PROVIDER`
+//! (default `openrouter`). Env namespace is distinct from A3 / A12 so
 //! operators can run separate models for dry-run auditing,
 //! eval scoring, and spec-challenge scoring in the same session:
 //!
-//! - `OPENROUTER_API_KEY` required.
-//! - `SENTINEL_SPEC_CHALLENGE_SCORER_MODEL` defaults to
-//!   `anthropic/claude-opus-4.7`.
+//! - `provider=openrouter` (default):
+//!   - `OPENROUTER_API_KEY` required.
+//!   - `SENTINEL_SPEC_CHALLENGE_SCORER_MODEL` defaults to
+//!     `anthropic/claude-opus-4.7`.
+//! - `provider=ollama` (any OpenAI-compatible `/v1` endpoint — local
+//!   ollama daemon, vLLM, litellm, or Ollama Cloud):
+//!   - `SENTINEL_SPEC_CHALLENGE_SCORER_MODEL` required (no sensible
+//!     default — pick what you serve).
+//!   - `OLLAMA_BASE_URL` optional; used verbatim when set (e.g.
+//!     `http://172.16.100.195:8000/v1` for a vLLM seat). Without it,
+//!     `OLLAMA_HOST` (default `http://localhost:11434`) + `/v1`.
+//!   - `OLLAMA_API_KEY` optional; when set, bearer auth is sent and the
+//!     default base URL switches to Ollama Cloud.
+//!   - Notably does NOT require `OPENROUTER_API_KEY` — local seats run
+//!     without any OpenRouter credentials.
 //!
 //! ## What the judge scores
 //!
@@ -39,11 +52,9 @@ use sentinel_domain::ports::{
 };
 use sentinel_domain::spec_challenge::SpecChallenge;
 
-#[cfg(test)]
-use crate::llm_scorer_runtime::build_ollama_prompt_fn;
 use crate::llm_scorer_runtime::{
-    self, build_openrouter_prompt_fn, preview, read_timeout, real_env, sidecar, strip_code_fence,
-    PromptFn,
+    self, build_ollama_prompt_fn, build_openrouter_prompt_fn, preview, read_timeout, real_env,
+    sidecar, strip_code_fence, PromptFn,
 };
 
 pub const DEFAULT_SCORER_PROVIDER: &str = "openrouter";
@@ -101,7 +112,10 @@ impl LlmSpecChallengeScorer {
         Self::openrouter_from_env_with(real_env)
     }
 
-    #[cfg(test)]
+    /// Construct an Ollama-style scorer (any OpenAI-compatible `/v1`
+    /// endpoint — local ollama daemon, vLLM, litellm, or Ollama Cloud)
+    /// from environment. See the module docs for the env contract.
+    /// Does NOT read `OPENROUTER_API_KEY`.
     pub fn ollama_from_env() -> Result<Self> {
         Self::ollama_from_env_with(real_env)
     }
@@ -115,13 +129,10 @@ impl LlmSpecChallengeScorer {
             .to_lowercase();
         match provider.as_str() {
             "openrouter" => Self::openrouter_from_env_with(env),
-            "ollama" => Err(anyhow::anyhow!(
-                "SENTINEL_SPEC_CHALLENGE_SCORER_PROVIDER=ollama is not a direct env provider; \
-                 spec-challenge scoring must use the OpenRouter scorer path"
-            )),
+            "ollama" => Self::ollama_from_env_with(env),
             other => Err(anyhow::anyhow!(
                 "unknown SENTINEL_SPEC_CHALLENGE_SCORER_PROVIDER={other:?}; \
-                 expected: openrouter"
+                 expected: openrouter, ollama"
             )),
         }
     }
@@ -150,14 +161,13 @@ impl LlmSpecChallengeScorer {
         })
     }
 
-    #[cfg(test)]
     fn ollama_from_env_with<F>(env: F) -> Result<Self>
     where
         F: Fn(&str) -> Option<String>,
     {
         let model_id = env("SENTINEL_SPEC_CHALLENGE_SCORER_MODEL").context(
-            "SENTINEL_SPEC_CHALLENGE_SCORER_MODEL not set (required for ollama scorer; \
-             no sensible default — pick what you've pulled)",
+            "SENTINEL_SPEC_CHALLENGE_SCORER_MODEL not set (required for ollama \
+             spec-challenge scorer; no sensible default — pick what you serve)",
         )?;
         let timeout = read_timeout(
             &env,
@@ -512,33 +522,143 @@ mod tests {
             .contains("unknown SENTINEL_SPEC_CHALLENGE_SCORER_PROVIDER"));
     }
 
+    // -----------------------------------------------------------------------
+    // Provider dispatch — openrouter (default) happy / missing-config paths
+    // -----------------------------------------------------------------------
+
+    /// No provider var → default openrouter; with the API key present the
+    /// scorer constructs and defaults the model.
     #[test]
-    fn from_env_rejects_direct_ollama_provider() {
-        let result = LlmSpecChallengeScorer::from_env_with(|key| match key {
-            "SENTINEL_SPEC_CHALLENGE_SCORER_PROVIDER" => Some("ollama".to_string()),
-            "SENTINEL_SPEC_CHALLENGE_SCORER_MODEL" => Some("qwen3:8b".to_string()),
+    fn from_env_defaults_to_openrouter_and_constructs() {
+        let scorer = LlmSpecChallengeScorer::from_env_with(|key| match key {
+            "OPENROUTER_API_KEY" => Some("fake-key".to_string()),
             _ => None,
-        });
-        let err = result.unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("spec-challenge scoring must use the OpenRouter scorer path"));
+        })
+        .expect("default openrouter provider should construct");
+        assert_eq!(scorer.provider_prefix, "openrouter");
+        assert_eq!(scorer.model_id, DEFAULT_SCORER_OPENROUTER_MODEL);
     }
 
+    /// Explicit `provider=openrouter` honors the model override.
+    #[test]
+    fn from_env_openrouter_honors_model_override() {
+        let scorer = LlmSpecChallengeScorer::from_env_with(|key| match key {
+            "SENTINEL_SPEC_CHALLENGE_SCORER_PROVIDER" => Some("openrouter".to_string()),
+            "OPENROUTER_API_KEY" => Some("fake-key".to_string()),
+            "SENTINEL_SPEC_CHALLENGE_SCORER_MODEL" => Some("openai/gpt-5.5-pro".to_string()),
+            _ => None,
+        })
+        .expect("openrouter provider should construct");
+        assert_eq!(scorer.model_id, "openai/gpt-5.5-pro");
+    }
+
+    /// Missing key error names both the exact env var and the provider.
     #[test]
     fn openrouter_from_env_requires_api_key() {
         let result = LlmSpecChallengeScorer::openrouter_from_env_with(|_| None);
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("OPENROUTER_API_KEY"));
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("OPENROUTER_API_KEY"), "{err}");
+        assert!(err.contains("openrouter"), "{err}");
     }
 
+    // -----------------------------------------------------------------------
+    // Provider dispatch — ollama (first-class runtime provider)
+    // -----------------------------------------------------------------------
+
+    /// `provider=ollama` is a real runtime provider: it constructs WITHOUT
+    /// `OPENROUTER_API_KEY` anywhere in the environment. This is the exact
+    /// benchmark-SessionStart scenario that used to fail closed.
+    #[test]
+    fn from_env_ollama_constructs_without_openrouter_api_key() {
+        let scorer = LlmSpecChallengeScorer::from_env_with(|key| match key {
+            "SENTINEL_SPEC_CHALLENGE_SCORER_PROVIDER" => Some("ollama".to_string()),
+            "SENTINEL_SPEC_CHALLENGE_SCORER_MODEL" => Some("qwen3:8b".to_string()),
+            // OPENROUTER_API_KEY deliberately absent.
+            _ => None,
+        })
+        .expect("ollama provider must construct without OPENROUTER_API_KEY");
+        assert_eq!(scorer.provider_prefix, "ollama-local");
+        assert_eq!(scorer.model_id, "qwen3:8b");
+    }
+
+    /// Keyless ollama honors `OLLAMA_BASE_URL` verbatim — the bench local
+    /// seat is a vLLM OpenAI-compatible `/v1` endpoint, not an ollama daemon.
+    #[test]
+    fn from_env_ollama_accepts_vllm_style_base_url() {
+        let scorer = LlmSpecChallengeScorer::from_env_with(|key| match key {
+            "SENTINEL_SPEC_CHALLENGE_SCORER_PROVIDER" => Some("ollama".to_string()),
+            "SENTINEL_SPEC_CHALLENGE_SCORER_MODEL" => Some("qwen3-35b".to_string()),
+            "OLLAMA_BASE_URL" => Some("http://172.16.100.195:8000/v1".to_string()),
+            _ => None,
+        })
+        .expect("vLLM-style OLLAMA_BASE_URL must be accepted keyless");
+        assert_eq!(scorer.provider_prefix, "ollama-local");
+    }
+
+    /// With `OLLAMA_API_KEY` set the cloud/authenticated mode is selected.
+    #[test]
+    fn from_env_ollama_cloud_mode_when_api_key_set() {
+        let scorer = LlmSpecChallengeScorer::from_env_with(|key| match key {
+            "SENTINEL_SPEC_CHALLENGE_SCORER_PROVIDER" => Some("ollama".to_string()),
+            "SENTINEL_SPEC_CHALLENGE_SCORER_MODEL" => Some("kimi-k2.6".to_string()),
+            "OLLAMA_API_KEY" => Some("fake-cloud-key".to_string()),
+            _ => None,
+        })
+        .expect("ollama cloud mode should construct");
+        assert_eq!(scorer.provider_prefix, "ollama-cloud");
+    }
+
+    /// Provider dispatch is case-insensitive (matches the openrouter path).
+    #[test]
+    fn from_env_ollama_provider_is_case_insensitive() {
+        let scorer = LlmSpecChallengeScorer::from_env_with(|key| match key {
+            "SENTINEL_SPEC_CHALLENGE_SCORER_PROVIDER" => Some("OLLAMA".to_string()),
+            "SENTINEL_SPEC_CHALLENGE_SCORER_MODEL" => Some("qwen3:8b".to_string()),
+            _ => None,
+        })
+        .expect("uppercase provider value should dispatch");
+        assert_eq!(scorer.provider_prefix, "ollama-local");
+    }
+
+    /// Missing model error names the exact env var and the provider — the
+    /// model stays required for ollama (no sensible default).
     #[test]
     fn ollama_from_env_requires_scorer_model() {
         let result = LlmSpecChallengeScorer::ollama_from_env_with(|_| None);
-        let err = result.unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("SENTINEL_SPEC_CHALLENGE_SCORER_MODEL"));
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("SENTINEL_SPEC_CHALLENGE_SCORER_MODEL"),
+            "{err}"
+        );
+        assert!(err.contains("ollama"), "{err}");
+    }
+
+    /// The same missing-model failure surfaces through the `from_env`
+    /// dispatch path, not just the direct constructor.
+    #[test]
+    fn from_env_ollama_missing_model_errors() {
+        let result = LlmSpecChallengeScorer::from_env_with(|key| match key {
+            "SENTINEL_SPEC_CHALLENGE_SCORER_PROVIDER" => Some("ollama".to_string()),
+            _ => None,
+        });
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("SENTINEL_SPEC_CHALLENGE_SCORER_MODEL"),
+            "{err}"
+        );
+    }
+
+    /// Ollama timeout override flows through the shared `read_timeout`.
+    #[test]
+    fn from_env_ollama_honors_timeout_override() {
+        let scorer = LlmSpecChallengeScorer::from_env_with(|key| match key {
+            "SENTINEL_SPEC_CHALLENGE_SCORER_PROVIDER" => Some("ollama".to_string()),
+            "SENTINEL_SPEC_CHALLENGE_SCORER_MODEL" => Some("qwen3:8b".to_string()),
+            "SENTINEL_SPEC_CHALLENGE_SCORER_TIMEOUT_SECS" => Some("120".to_string()),
+            _ => None,
+        })
+        .expect("ollama provider with timeout override should construct");
+        assert_eq!(scorer.timeout, Duration::from_secs(120));
     }
 
     #[test]
